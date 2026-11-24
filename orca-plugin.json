@@ -1,0 +1,128 @@
+{
+  "manifestVersion": 2,
+  "id": "sftp-bridge",
+  "name": "SFTP Bridge",
+  "version": "0.2.0",
+  "description": "Dual-pane and tabbed SFTP browser for Orca SSH hosts and Remote Orca Servers with pause/resume priority transfer queue, server-side archive/extract, and quick file editor.",
+  "repository": "https://github.com/hygorfragas/sftp-bridge",
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "dist/worker.mjs",
+  "contributes": {
+    "panels": [
+      {
+        "id": "sftp-bridge",
+        "title": "SFTP Bridge",
+        "icon": "globe",
+        "entry": "panel/index.html",
+        "ui": "html"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "sftp-status",
+        "text": "SFTP",
+        "icon": "globe",
+        "tone": "neutral",
+        "tooltip": "SFTP Bridge — status de conexões e transferências",
+        "command": "sftp.status"
+      }
+    ],
+    "commands": [
+      {
+        "id": "sftp.status",
+        "title": "SFTP Bridge: Mostrar status da fila"
+      },
+      {
+        "id": "sftp.pauseAll",
+        "title": "SFTP Bridge: Pausar todas as transferências"
+      },
+      {
+        "id": "sftp.resumeAll",
+        "title": "SFTP Bridge: Retomar todas as transferências"
+      },
+      {
+        "id": "sftp.refreshHosts",
+        "title": "SFTP Bridge: Atualizar lista de hosts Orca e SSH"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.changed"
+      }
+    ],
+    "settings": [
+      {
+        "key": "defaultLayout",
+        "title": "Layout padrão do painel",
+        "description": "Escolha entre abas (ideal para sidebar estreita) ou dividido estilo Electerm.",
+        "type": "string",
+        "default": "tabs",
+        "enum": ["tabs", "split"],
+        "enumLabels": ["Abas (Local / Remoto / Transferências)", "Dividido (Local | Remoto)"]
+      },
+      {
+        "key": "maxConcurrentTransfers",
+        "title": "Transferências simultâneas",
+        "description": "Número máximo de arquivos transferidos ao mesmo tempo na fila.",
+        "type": "integer",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 6
+      },
+      {
+        "key": "showHiddenFiles",
+        "title": "Mostrar arquivos ocultos",
+        "description": "Exibe arquivos e pastas iniciados com ponto (.) por padrão.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "defaultArchiveFormat",
+        "title": "Formato padrão de compactação",
+        "description": "Formato pré-selecionado ao compactar arquivos ou pastas.",
+        "type": "string",
+        "default": "zip",
+        "enum": ["zip", "tar.gz"],
+        "enumLabels": ["ZIP (.zip)", "TAR GZIP (.tar.gz)"]
+      },
+      {
+        "key": "notifyOnQueueComplete",
+        "title": "Notificar ao concluir transferências",
+        "description": "Exibe uma notificação desktop quando a fila de transferências terminar.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "maxEditableFileKB",
+        "title": "Tamanho máximo no editor rápido (KB)",
+        "description": "Limite de segurança para abrir arquivos no editor integrado.",
+        "type": "integer",
+        "default": 1024,
+        "minimum": 64,
+        "maximum": 4096
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}
