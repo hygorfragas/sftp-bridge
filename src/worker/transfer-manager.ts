@@ -2,6 +2,7 @@ import { mkdir, open as openLocalFile, readdir, rename, stat, unlink } from 'nod
 import { dirname, join } from 'node:path'
 import { posixDirname, posixJoin } from '../shared/file-utils.ts'
 import type {
+  Side,
   TransferDirection,
   TransferItem,
   TransferPriority,
@@ -122,25 +123,52 @@ export class TransferManager {
   enqueue(params: {
     hostId: string
     hostName: string
+    sourceSide?: Side
+    sourceHostId?: string
+    sourceHostName?: string
+    targetSide?: Side
+    targetHostId?: string
+    targetHostName?: string
     direction: TransferDirection
     items: EnqueueTransferItemInput[]
     priority?: TransferPriority
   }): TransferSnapshot {
     const priority = params.priority || 'normal'
     const now = Date.now()
+    const sourceSide: Side =
+      params.sourceSide || (params.direction === 'upload' ? 'local' : 'remote')
+    const targetSide: Side =
+      params.targetSide || (params.direction === 'download' ? 'local' : 'remote')
+    const sourceHostId =
+      sourceSide === 'remote' ? params.sourceHostId || params.hostId : undefined
+    const targetHostId =
+      targetSide === 'remote' ? params.targetHostId || params.hostId : undefined
+    const sourceHostName =
+      sourceSide === 'remote' ? params.sourceHostName || params.hostName : 'Local'
+    const targetHostName =
+      targetSide === 'remote' ? params.targetHostName || params.hostName : 'Local'
 
     for (const input of params.items) {
       const id = `tx-${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`
       const finalName = input.targetName?.trim() || input.name
       const targetPath =
-        params.direction === 'upload'
+        targetSide === 'remote'
           ? posixJoin(input.targetDir, finalName)
           : join(input.targetDir, finalName)
 
       const item: TransferItem = {
         id,
-        hostId: params.hostId,
-        hostName: params.hostName,
+        hostId: targetHostId || sourceHostId || params.hostId,
+        hostName:
+          params.direction === 'remote-to-remote'
+            ? `${sourceHostName} → ${targetHostName}`
+            : params.hostName,
+        sourceSide,
+        sourceHostId,
+        sourceHostName,
+        targetSide,
+        targetHostId,
+        targetHostName,
         direction: params.direction,
         sourcePath: input.sourcePath,
         targetPath,
@@ -355,18 +383,25 @@ export class TransferManager {
 
   private async runTransfer(entry: InternalTransfer): Promise<void> {
     try {
-      const transport = await this.hooks.getTransport(entry.item.hostId)
+      const sourceTransport =
+        entry.item.sourceSide === 'remote'
+          ? await this.hooks.getTransport(entry.item.sourceHostId || entry.item.hostId)
+          : null
+      const targetTransport =
+        entry.item.targetSide === 'remote'
+          ? await this.hooks.getTransport(entry.item.targetHostId || entry.item.hostId)
+          : null
 
       if (!entry.files) {
-        entry.files = await this.expandFileTasks(entry.item, transport)
+        entry.files = await this.expandFileTasks(entry.item, sourceTransport)
         entry.item.filesTotal = entry.files.length
         entry.item.totalBytes = entry.files.reduce((acc, f) => acc + f.size, 0)
         this.scheduleEmit(false)
       }
 
       if (entry.files.length === 0 && entry.item.isDirectory) {
-        if (entry.item.direction === 'upload') {
-          await transport.mkdirRecursive(entry.item.targetPath)
+        if (entry.item.targetSide === 'remote' && targetTransport) {
+          await targetTransport.mkdirRecursive(entry.item.targetPath)
         } else {
           await mkdir(entry.item.targetPath, { recursive: true })
         }
@@ -376,10 +411,12 @@ export class TransferManager {
         if (fileTask.completed) continue
         if (entry.abortReason) break
 
-        if (entry.item.direction === 'upload') {
-          await this.uploadSingleFile(entry, fileTask, transport)
-        } else {
-          await this.downloadSingleFile(entry, fileTask, transport)
+        if (entry.item.sourceSide === 'local' && targetTransport) {
+          await this.uploadSingleFile(entry, fileTask, targetTransport)
+        } else if (entry.item.targetSide === 'local' && sourceTransport) {
+          await this.downloadSingleFile(entry, fileTask, sourceTransport)
+        } else if (sourceTransport && targetTransport) {
+          await this.transferRemoteToRemoteFile(entry, fileTask, sourceTransport, targetTransport)
         }
 
         if (entry.abortReason) break
@@ -437,14 +474,17 @@ export class TransferManager {
     }
   }
 
-  private async expandFileTasks(item: TransferItem, transport: RemoteTransport): Promise<FileTask[]> {
+  private async expandFileTasks(
+    item: TransferItem,
+    sourceTransport: RemoteTransport | null
+  ): Promise<FileTask[]> {
     if (!item.isDirectory) {
       let size = item.totalBytes
-      if (item.direction === 'upload') {
+      if (item.sourceSide === 'local') {
         const st = await stat(item.sourcePath)
         size = st.size
-      } else if (!size) {
-        const st = await transport.stat(item.sourcePath)
+      } else if (!size && sourceTransport) {
+        const st = await sourceTransport.stat(item.sourcePath)
         size = st.size
       }
       return [
@@ -460,12 +500,12 @@ export class TransferManager {
     }
 
     const tasks: FileTask[] = []
-    if (item.direction === 'upload') {
-      const walkLocal = async (localDir: string, remoteDir: string) => {
+    if (item.sourceSide === 'local') {
+      const walkLocal = async (localDir: string, targetDir: string) => {
         const entries = await readdir(localDir, { withFileTypes: true })
         for (const e of entries) {
           const src = join(localDir, e.name)
-          const dst = posixJoin(remoteDir, e.name)
+          const dst = item.targetSide === 'remote' ? posixJoin(targetDir, e.name) : join(targetDir, e.name)
           if (e.isDirectory()) {
             await walkLocal(src, dst)
           } else if (e.isFile()) {
@@ -482,11 +522,11 @@ export class TransferManager {
         }
       }
       await walkLocal(item.sourcePath, item.targetPath)
-    } else {
-      const walkRemote = async (remoteDir: string, localDir: string) => {
-        const { entries } = await transport.listDir(remoteDir)
+    } else if (sourceTransport) {
+      const walkRemote = async (remoteDir: string, targetDir: string) => {
+        const { entries } = await sourceTransport.listDir(remoteDir)
         for (const e of entries) {
-          const dst = join(localDir, e.name)
+          const dst = item.targetSide === 'remote' ? posixJoin(targetDir, e.name) : join(targetDir, e.name)
           if (e.isDirectory && !e.isSymlink) {
             await walkRemote(e.path, dst)
           } else if (!e.isDirectory) {
@@ -606,6 +646,42 @@ export class TransferManager {
     }
   }
 
+  /** Streams 64 KB chunks directly from Remote A SFTP to Remote B SFTP without local temp files. */
+  private async transferRemoteToRemoteFile(
+    entry: InternalTransfer,
+    task: FileTask,
+    sourceTransport: RemoteTransport,
+    targetTransport: RemoteTransport
+  ): Promise<void> {
+    await targetTransport.mkdirRecursive(posixDirname(task.targetPath))
+    const srcHandle = await sourceTransport.openHandle(task.sourcePath, SFTP_OPEN_FLAGS.READ)
+    const dstFlags =
+      task.bytesDone > 0 ? SFTP_OPEN_FLAGS.WRITE_CREATE_RESUME : SFTP_OPEN_FLAGS.WRITE_CREATE_TRUNC
+    const dstHandle = await targetTransport.openHandle(task.tempTargetPath, dstFlags)
+    const buf = Buffer.allocUnsafe(CHUNK_SIZE)
+
+    try {
+      while (true) {
+        if (entry.abortReason) return
+        const bytesRead = await sourceTransport.readChunk(srcHandle, buf, 0, CHUNK_SIZE, task.bytesDone)
+        if (bytesRead <= 0) break
+        await targetTransport.writeChunk(dstHandle, buf, 0, bytesRead, task.bytesDone)
+        task.bytesDone += bytesRead
+        this.recordProgress(entry, bytesRead)
+      }
+    } finally {
+      await sourceTransport.closeHandle(srcHandle).catch(() => undefined)
+      await targetTransport.closeHandle(dstHandle).catch(() => undefined)
+    }
+
+    if (!entry.abortReason) {
+      if (entry.backupBeforeOverwrite) {
+        await this.backupExistingRemote(task.targetPath, targetTransport)
+      }
+      await targetTransport.renameExact(task.tempTargetPath, task.targetPath)
+    }
+  }
+
   private recordProgress(entry: InternalTransfer, deltaBytes: number): void {
     const now = Date.now()
     entry.item.bytesTransferred += deltaBytes
@@ -629,15 +705,16 @@ export class TransferManager {
 
   private async cleanupPartFiles(entry: InternalTransfer): Promise<void> {
     if (!entry.files) return
-    let transport: RemoteTransport | null = null
+    let targetTransport: RemoteTransport | null = null
     for (const f of entry.files) {
       if (f.completed) continue
-      if (entry.item.direction === 'download') {
+      if (entry.item.targetSide === 'local') {
         await unlink(f.tempTargetPath).catch(() => undefined)
       } else {
         try {
-          if (!transport) transport = await this.hooks.getTransport(entry.item.hostId)
-          await transport.unlink(f.tempTargetPath).catch(() => undefined)
+          const dstHostId = entry.item.targetHostId || entry.item.hostId
+          if (!targetTransport) targetTransport = await this.hooks.getTransport(dstHostId)
+          await targetTransport.unlink(f.tempTargetPath).catch(() => undefined)
         } catch {
           // ignore cleanup failure if disconnected
         }

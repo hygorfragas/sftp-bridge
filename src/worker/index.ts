@@ -14,8 +14,10 @@ import type {
   BookmarkEntry,
   ConnectionStatus,
   HostProfile,
+  HostSftpState,
   PersistedSessionState,
   PluginUserSettings,
+  Side,
   TransferConflict,
   TransferSnapshot,
   WorkspaceHint
@@ -68,12 +70,16 @@ const DEFAULT_SETTINGS: PluginUserSettings = {
   maxEditableFileKB: 1024
 }
 
-let activeTransport: RemoteTransport | null = null
+let activeTransportsRef: Map<string, RemoteTransport> | null = null
 let activeManager: TransferManager | null = null
+let activeHostPollTimer: ReturnType<typeof setInterval> | null = null
 const activeTails = new Map<string, { stop: () => void }>()
 
 export default function activate(orca: OrcaWorkerApi): void {
   const transports = new Map<string, RemoteTransport>()
+  activeTransportsRef = transports
+  const hostStates = new Map<string, HostSftpState>()
+  const manuallyDisconnected = new Set<string>()
   const activeChunkUploads = new Map<
     string,
     {
@@ -92,6 +98,139 @@ export default function activate(orca: OrcaWorkerApi): void {
     connecting: false
   }
   let currentSettings: PluginUserSettings = { ...DEFAULT_SETTINGS }
+
+  function getHostStatesSnapshot(): Record<string, HostSftpState> {
+    const out: Record<string, HostSftpState> = {}
+    for (const [id, st] of hostStates) {
+      if (st.state === 'connected') {
+        const t = transports.get(id)
+        // If synced from Orca (source === 'orca'), transport opens seamlessly on demand.
+        // Only mark dropped if an opened SFTP transport died or a manual SFTP session lost its transport.
+        if (t && !t.isAlive) {
+          const dropped: HostSftpState = {
+            hostId: id,
+            hostName: st.hostName,
+            state: 'disconnected'
+          }
+          hostStates.set(id, dropped)
+          out[id] = dropped
+          continue
+        }
+        if (!t && st.source !== 'orca') {
+          const dropped: HostSftpState = {
+            hostId: id,
+            hostName: st.hostName,
+            state: 'disconnected'
+          }
+          hostStates.set(id, dropped)
+          out[id] = dropped
+          continue
+        }
+      }
+      out[id] = { ...st }
+    }
+    return out
+  }
+
+  function syncOrcaHostStates(hosts: HostProfile[]): boolean {
+    let changed = false
+    const seenIds = new Set<string>()
+
+    for (const profile of hosts) {
+      seenIds.add(profile.id)
+      const cur = hostStates.get(profile.id)
+
+      if (profile.orcaStatus === 'connecting') {
+        if (cur?.state !== 'connecting') {
+          hostStates.set(profile.id, {
+            hostId: profile.id,
+            hostName: profile.name,
+            state: 'connecting',
+            source: 'orca'
+          })
+          changed = true
+        }
+      } else if (
+        profile.orcaStatus === 'connected' &&
+        !profile.needsSshBinding &&
+        !manuallyDisconnected.has(profile.id)
+      ) {
+        // Already connected in Orca -> automatically available & connected in SFTP Bridge!
+        if (!cur || cur.state === 'disconnected' || (cur.state === 'connecting' && cur.source === 'orca')) {
+          hostStates.set(profile.id, {
+            hostId: profile.id,
+            hostName: profile.name,
+            state: 'connected',
+            source: 'orca',
+            remoteHome: cur?.remoteHome
+          })
+          changed = true
+        }
+      } else if (
+        (profile.kind === 'orca-env' || profile.kind === 'orca-ssh') &&
+        profile.orcaStatus === 'disconnected'
+      ) {
+        // Disconnected in Orca -> mirror disconnected if it was Orca-synced (not manually forced)
+        if (cur && cur.source === 'orca' && cur.state !== 'disconnected') {
+          const t = transports.get(profile.id)
+          if (t) {
+            t.destroy()
+            transports.delete(profile.id)
+          }
+          hostStates.set(profile.id, {
+            hostId: profile.id,
+            hostName: profile.name,
+            state: 'disconnected',
+            source: 'orca'
+          })
+          changed = true
+        }
+      }
+    }
+
+    // Remove state entries for Orca hosts that were deleted in Orca settings
+    for (const [id, st] of [...hostStates.entries()]) {
+      if (!seenIds.has(id) && st.source === 'orca') {
+        const t = transports.get(id)
+        if (t) {
+          t.destroy()
+          transports.delete(id)
+        }
+        hostStates.delete(id)
+        changed = true
+      }
+    }
+
+    return changed
+  }
+
+  function setHostState(next: HostSftpState): void {
+    hostStates.set(next.hostId, next)
+    post('hostStates.updated', getHostStatesSnapshot())
+  }
+
+  function refreshLegacyConnectionStatus(): void {
+    const connected = Object.values(getHostStatesSnapshot()).filter((s) => s.state === 'connected')
+    if (connected.length > 0) {
+      const current =
+        connected.find((c) => c.hostId === connectionStatus.hostId) || connected[connected.length - 1]
+      connectionStatus = {
+        hostId: current.hostId,
+        hostName: current.hostName,
+        connected: true,
+        connecting: false,
+        transportMode: current.transportMode,
+        remoteHome: current.remoteHome
+      }
+    } else {
+      connectionStatus = {
+        hostId: null,
+        hostName: null,
+        connected: false,
+        connecting: false
+      }
+    }
+  }
 
   async function loadSettings(): Promise<PluginUserSettings> {
     try {
@@ -171,7 +310,15 @@ export default function activate(orca: OrcaWorkerApi): void {
           raw?.activeTab === 'remote' || raw?.activeTab === 'transfers' ? raw.activeTab : 'local',
         layout: raw?.layout === 'split' || raw?.layout === 'tabs' ? raw.layout : undefined,
         splitRatio: typeof raw?.splitRatio === 'number' ? raw.splitRatio : undefined,
-        syncBrowsing: Boolean(raw?.syncBrowsing)
+        syncBrowsing: Boolean(raw?.syncBrowsing),
+        leftEndpoint:
+          raw?.leftEndpoint && (raw.leftEndpoint.kind === 'local' || raw.leftEndpoint.kind === 'remote')
+            ? raw.leftEndpoint
+            : { kind: 'local' },
+        rightEndpoint:
+          raw?.rightEndpoint && (raw.rightEndpoint.kind === 'local' || raw.rightEndpoint.kind === 'remote')
+            ? raw.rightEndpoint
+            : undefined
       }
     } catch {
       cachedSession = { ...DEFAULT_SESSION, remotePathsByHost: {} }
@@ -197,6 +344,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   async function refreshHosts(): Promise<HostProfile[]> {
     const bindings = await loadSavedBindings()
     cachedHosts = await discoverAllHosts(bindings)
+    syncOrcaHostStates(cachedHosts)
     return cachedHosts
   }
 
@@ -209,6 +357,22 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   function updateStatusBar(snapshot: TransferSnapshot): void {
     const activeTotal = snapshot.activeCount + snapshot.queuedCount
+    const allStates = getHostStatesSnapshot()
+    const connectedHosts = Object.values(allStates).filter((s) => s.state === 'connected')
+    const connectingHosts = Object.values(allStates).filter((s) => s.state === 'connecting')
+
+    // Derive active pane endpoints so the footer accurately reflects Local × Remote vs Remote A ⇄ Remote B
+    const leftEp = cachedSession?.leftEndpoint || { kind: 'local' as const }
+    const rightEp = cachedSession?.rightEndpoint
+    const leftRemote =
+      leftEp.kind === 'remote' && allStates[leftEp.hostId]?.state === 'connected'
+        ? allStates[leftEp.hostId]
+        : null
+    const rightRemote =
+      rightEp?.kind === 'remote' && allStates[rightEp.hostId]?.state === 'connected'
+        ? allStates[rightEp.hostId]
+        : null
+
     let text = 'SFTP'
     let tone: 'neutral' | 'accent' | 'success' | 'warning' | 'danger' = 'neutral'
     let tooltip = 'SFTP Bridge'
@@ -229,10 +393,23 @@ export default function activate(orca: OrcaWorkerApi): void {
       text = `SFTP · ${snapshot.pausedCount} pausada(s)`
       tone = 'warning'
       tooltip = 'Transferências pausadas no SFTP Bridge'
-    } else if (connectionStatus.connected && connectionStatus.hostName) {
-      text = `SFTP · ${connectionStatus.hostName}`
+    } else if (leftRemote && rightRemote && leftRemote.hostId !== rightRemote.hostId) {
+      text = `SFTP · ${leftRemote.hostName} ⇄ ${rightRemote.hostName}`
       tone = 'success'
-      tooltip = `Conectado via ${connectionStatus.transportMode || 'SFTP'} em ${connectionStatus.hostName}`
+      tooltip = `Remoto ⇄ Remoto ativo: ${leftRemote.hostName} e ${rightRemote.hostName}`
+    } else if (rightRemote || leftRemote) {
+      const active = (rightRemote || leftRemote)!
+      text = `SFTP · ${active.hostName}`
+      tone = 'success'
+      tooltip = `Conectado em ${active.hostName} (${connectedHosts.length} host(s) online)`
+    } else if (connectingHosts.length > 0) {
+      text = `SFTP · conectando...`
+      tone = 'warning'
+      tooltip = `Conectando a ${connectingHosts.map((h) => h.hostName).join(', ')}`
+    } else if (connectedHosts.length > 0) {
+      text = `SFTP · ${connectedHosts.length} online`
+      tone = 'success'
+      tooltip = `${connectedHosts.length} host(s) pronto(s): ${connectedHosts.map((h) => h.hostName).join(', ')}`
     }
 
     void orca.host
@@ -240,9 +417,17 @@ export default function activate(orca: OrcaWorkerApi): void {
       .catch(() => undefined)
   }
 
-  async function getOrConnectTransport(hostId: string): Promise<RemoteTransport> {
-    const existing = transports.get(hostId)
-    if (existing && existing.isAlive) return existing
+  async function getOrConnectTransport(hostId: string, forceReconnect = false): Promise<RemoteTransport> {
+    if (forceReconnect) {
+      const old = transports.get(hostId)
+      if (old) {
+        old.destroy()
+        transports.delete(hostId)
+      }
+    } else {
+      const existing = transports.get(hostId)
+      if (existing && existing.isAlive) return existing
+    }
 
     const profile = await getHostProfile(hostId)
     if (profile.needsSshBinding) {
@@ -259,18 +444,48 @@ export default function activate(orca: OrcaWorkerApi): void {
 
     const transport = await SshSftpTransport.connect(profile, secret)
     transports.set(hostId, transport)
-    activeTransport = transport
     return transport
   }
 
-  function resolveActiveTransport(hostId?: string): RemoteTransport {
+  async function resolveActiveTransport(hostId?: string): Promise<RemoteTransport> {
     const id = hostId || connectionStatus.hostId
-    if (!id) throw new Error('Nenhum host remoto conectado. Selecione um host no topo do painel.')
+    if (!id) throw new Error('Nenhum host remoto conectado. Selecione um host para abrir a ponte SFTP.')
     const transport = transports.get(id)
-    if (!transport || !transport.isAlive) {
-      throw new Error('Sessão SFTP desconectada. Clique em reconectar para continuar.')
+    if (transport && transport.isAlive) return transport
+
+    // Seamless on-demand SFTP open for Orca-connected hosts
+    const state = hostStates.get(id)
+    if (state?.state === 'connected' && state.source === 'orca') {
+      try {
+        const opened = await getOrConnectTransport(id, false)
+        const homePath = await opened.realpath('.').catch(() => '.')
+        setHostState({
+          hostId: id,
+          hostName: state.hostName,
+          state: 'connected',
+          source: 'orca',
+          transportMode: opened.mode,
+          remoteHome: homePath
+        })
+        refreshLegacyConnectionStatus()
+        updateStatusBar(transferManager.getSnapshot())
+        return opened
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        setHostState({
+          hostId: id,
+          hostName: state.hostName,
+          state: 'error',
+          error: message
+        })
+        throw err
+      }
     }
-    return transport
+
+    if (state && state.state === 'connected') {
+      setHostState({ hostId: id, hostName: state.hostName, state: 'disconnected' })
+    }
+    throw new Error('Sessão SFTP desconectada. Clique em reconectar para continuar.')
   }
 
   async function computeWorkspaceHint(): Promise<WorkspaceHint> {
@@ -357,12 +572,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     ])
     transferManager.setMaxConcurrent(settings.maxConcurrentTransfers)
     const transfers = transferManager.getSnapshot()
+    const states = getHostStatesSnapshot()
+    refreshLegacyConnectionStatus()
     updateStatusBar(transfers)
     return {
       localHome: getLocalHome(),
       settings,
       hosts,
       connection: connectionStatus,
+      hostStates: states,
       transfers,
       bookmarks,
       workspaceHint,
@@ -372,12 +590,15 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   handle('session.save', async (patch) => {
     const session = await patchSession(patch)
+    if ('leftEndpoint' in patch || 'rightEndpoint' in patch) {
+      updateStatusBar(transferManager.getSnapshot())
+    }
     return { session }
   })
 
   handle('hosts.list', async () => {
     const hosts = await refreshHosts()
-    return { hosts }
+    return { hosts, hostStates: getHostStatesSnapshot() }
   })
 
   handle('hosts.save', async (input) => {
@@ -422,17 +643,25 @@ export default function activate(orca: OrcaWorkerApi): void {
       t.destroy()
       transports.delete(hostId)
     }
-    if (connectionStatus.hostId === hostId) {
-      connectionStatus = { hostId: null, hostName: null, connected: false, connecting: false }
-      post('connection.updated', connectionStatus)
-    }
+    hostStates.delete(hostId)
+    refreshLegacyConnectionStatus()
+    post('hostStates.updated', getHostStatesSnapshot())
+    post('connection.updated', connectionStatus)
+    updateStatusBar(transferManager.getSnapshot())
     const hosts = await refreshHosts()
     post('hosts.updated', { hosts })
     return { hosts }
   })
 
-  handle('connection.connect', async ({ hostId }) => {
+  handle('connection.connect', async ({ hostId, forceReconnect }) => {
     const profile = await getHostProfile(hostId)
+    manuallyDisconnected.delete(profile.id)
+    setHostState({
+      hostId: profile.id,
+      hostName: profile.name,
+      state: 'connecting',
+      source: 'sftp'
+    })
     connectionStatus = {
       hostId: profile.id,
       hostName: profile.name,
@@ -440,9 +669,10 @@ export default function activate(orca: OrcaWorkerApi): void {
       connecting: true
     }
     post('connection.updated', connectionStatus)
+    updateStatusBar(transferManager.getSnapshot())
 
     try {
-      const transport = await getOrConnectTransport(hostId)
+      const transport = await getOrConnectTransport(hostId, Boolean(forceReconnect))
       const session = await loadSession()
       const rememberedPath = session.remotePathsByHost[hostId]
       const initialPath = rememberedPath || profile.defaultRemotePath || '.'
@@ -453,6 +683,15 @@ export default function activate(orca: OrcaWorkerApi): void {
         listing = await transport.listDir('.')
       }
       const homePath = await transport.realpath('.').catch(() => listing.path)
+      const nextHostState: HostSftpState = {
+        hostId: profile.id,
+        hostName: profile.name,
+        state: 'connected',
+        source: profile.orcaStatus === 'connected' ? 'orca' : 'sftp',
+        transportMode: transport.mode,
+        remoteHome: homePath
+      }
+      setHostState(nextHostState)
       connectionStatus = {
         hostId: profile.id,
         hostName: profile.name,
@@ -470,11 +709,19 @@ export default function activate(orca: OrcaWorkerApi): void {
       updateStatusBar(transferManager.getSnapshot())
       return {
         connection: connectionStatus,
+        hostState: nextHostState,
+        hostStates: getHostStatesSnapshot(),
         remotePath: listing.path,
         entries: listing.entries
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      setHostState({
+        hostId: profile.id,
+        hostName: profile.name,
+        state: 'error',
+        error: message
+      })
       connectionStatus = {
         hostId: profile.id,
         hostName: profile.name,
@@ -489,19 +736,47 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   })
 
-  handle('connection.disconnect', async () => {
-    if (connectionStatus.hostId) {
-      const t = transports.get(connectionStatus.hostId)
+  handle('connection.disconnect', async (input) => {
+    const targetId = input?.hostId
+    if (targetId) {
+      manuallyDisconnected.add(targetId)
+      const t = transports.get(targetId)
       if (t) {
         t.destroy()
-        transports.delete(connectionStatus.hostId)
+        transports.delete(targetId)
       }
+      const prev = hostStates.get(targetId)
+      setHostState({
+        hostId: targetId,
+        hostName: prev?.hostName || targetId,
+        state: 'disconnected'
+      })
+    } else {
+      for (const [id, t] of transports) {
+        manuallyDisconnected.add(id)
+        t.destroy()
+        const prev = hostStates.get(id)
+        hostStates.set(id, {
+          hostId: id,
+          hostName: prev?.hostName || id,
+          state: 'disconnected'
+        })
+      }
+      transports.clear()
+      for (const [id, st] of hostStates) {
+        if (st.state === 'connected') {
+          manuallyDisconnected.add(id)
+          hostStates.set(id, { hostId: id, hostName: st.hostName, state: 'disconnected' })
+        }
+      }
+      post('hostStates.updated', getHostStatesSnapshot())
     }
-    connectionStatus = { hostId: null, hostName: null, connected: false, connecting: false }
-    await patchSession({ wasConnected: false }).catch(() => undefined)
+    refreshLegacyConnectionStatus()
+    const stillConnected = Object.values(getHostStatesSnapshot()).some((s) => s.state === 'connected')
+    await patchSession({ wasConnected: stillConnected }).catch(() => undefined)
     post('connection.updated', connectionStatus)
     updateStatusBar(transferManager.getSnapshot())
-    return { connection: connectionStatus }
+    return { connection: connectionStatus, hostStates: getHostStatesSnapshot() }
   })
 
   handle('fs.list', async ({ side, path, hostId }) => {
@@ -510,7 +785,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       void patchSession({ lastLocalPath: res.path }).catch(() => undefined)
       return { side: 'local' as const, path: res.path, entries: res.entries }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     const res = await transport.listDir(path || '.')
     void patchSession({ remotePathsByHost: { [transport.hostId]: res.path } }).catch(() => undefined)
     return { side: 'remote' as const, path: res.path, entries: res.entries }
@@ -520,7 +795,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return { createdPath: await mkdirLocal(parentPath, name) }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return { createdPath: await transport.mkdir(parentPath, name) }
   })
 
@@ -528,7 +803,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return { createdPath: await createFileLocal(parentPath, name, content) }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return { createdPath: await transport.createFile(parentPath, name, content) }
   })
 
@@ -536,7 +811,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return { newPath: await renameLocal(oldPath, newName) }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return { newPath: await transport.rename(oldPath, newName) }
   })
 
@@ -544,7 +819,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return { deletedCount: await deleteLocal(paths) }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return { deletedCount: await transport.deletePaths(paths) }
   })
 
@@ -553,7 +828,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       await chmodLocal(path, mode)
       return { ok: true as const }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     await transport.chmod(path, mode)
     return { ok: true as const }
   })
@@ -562,7 +837,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return searchLocalRecursive(rootPath, query, maxResults)
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return transport.searchRecursive(rootPath, query, maxResults)
   })
 
@@ -571,7 +846,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!cleanName || cleanName.includes('/') || cleanName === '.' || cleanName === '..') {
       throw new Error('Nome de arquivo inválido para upload.')
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     const targetPath = posixJoin(targetDir, cleanName)
     const tempPath = `${targetPath}.orca-sftp.part`
     const handleBuf = await transport.openHandle(tempPath, SFTP_OPEN_FLAGS.WRITE_CREATE_TRUNC)
@@ -627,7 +902,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return readLocalImage(path, maxBytes)
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     const name = posixBasename(path)
     const mimeType = getImageMimeType(name)
     if (!mimeType) throw new Error(`Formato de imagem não suportado: ${name}`)
@@ -682,7 +957,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       handleTail = startLocalTail(path, lines || 200, onChunk, onClose)
     } else {
-      const transport = resolveActiveTransport(hostId)
+      const transport = await resolveActiveTransport(hostId)
       handleTail = transport.startTail(path, lines || 200, onChunk, onClose)
     }
 
@@ -711,7 +986,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const archivePath = await compressLocal(cwd, names, archiveName, format)
       return { archivePath }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     const archivePath = await transport.compress(cwd, names, archiveName, format)
     return { archivePath }
   })
@@ -721,7 +996,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const extractedTo = await extractLocal(archivePath, destinationDir, createSubfolder)
       return { extractedTo }
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     const extractedTo = await transport.extract(archivePath, destinationDir, createSubfolder)
     return { extractedTo }
   })
@@ -732,7 +1007,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return readLocalText(path, maxBytes, forceText)
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return transport.readText(path, maxBytes, forceText)
   })
 
@@ -740,15 +1015,17 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (side === 'local') {
       return writeLocalText(path, content)
     }
-    const transport = resolveActiveTransport(hostId)
+    const transport = await resolveActiveTransport(hostId)
     return transport.writeText(path, content)
   })
 
-  handle('transfers.checkConflicts', async ({ hostId, direction, items }) => {
+  handle('transfers.checkConflicts', async ({ hostId, targetSide: reqTargetSide, targetHostId, direction, items }) => {
     const conflicts: TransferConflict[] = []
     if (!items.length) return { conflicts }
 
-    const transport = direction === 'upload' ? resolveActiveTransport(hostId) : null
+    const targetSide: Side = reqTargetSide || (direction === 'download' ? 'local' : 'remote')
+    const targetTransport =
+      targetSide === 'remote' ? await resolveActiveTransport(targetHostId || hostId) : null
     const dirNamesCache = new Map<string, Set<string>>()
 
     const getExistingNames = async (dir: string): Promise<Set<string>> => {
@@ -756,11 +1033,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (cached) return cached
       const names = new Set<string>()
       try {
-        if (direction === 'download') {
+        if (targetSide === 'local') {
           const list = await readdir(dir)
           for (const n of list) names.add(n)
-        } else if (transport) {
-          const { entries } = await transport.listDir(dir)
+        } else if (targetTransport) {
+          const { entries } = await targetTransport.listDir(dir)
           for (const e of entries) names.add(e.name)
         }
       } catch {
@@ -775,7 +1052,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (!existingNames.has(item.name)) continue
 
       const targetPath =
-        direction === 'upload'
+        targetSide === 'remote'
           ? posixJoin(item.targetDir, item.name)
           : join(item.targetDir, item.name)
 
@@ -784,13 +1061,13 @@ export default function activate(orca: OrcaWorkerApi): void {
       let targetIsDirectory = false
 
       try {
-        if (direction === 'download') {
+        if (targetSide === 'local') {
           const st = await stat(targetPath)
           targetSize = st.isDirectory() ? 0 : st.size
           targetMtimeMs = st.mtimeMs
           targetIsDirectory = st.isDirectory()
-        } else if (transport) {
-          const st = await transport.stat(targetPath)
+        } else if (targetTransport) {
+          const st = await targetTransport.stat(targetPath)
           targetSize = st.isDirectory ? 0 : st.size
           targetMtimeMs = st.mtimeMs
           targetIsDirectory = st.isDirectory
@@ -819,74 +1096,99 @@ export default function activate(orca: OrcaWorkerApi): void {
     return { conflicts }
   })
 
-  handle('transfers.diffConflict', async ({ hostId, direction, sourcePath, targetPath }) => {
-    const MAX_DIFF_BYTES = 256 * 1024
-    const transport = resolveActiveTransport(hostId)
+  handle(
+    'transfers.diffConflict',
+    async ({ hostId, sourceSide: reqSrcSide, sourceHostId, targetSide: reqDstSide, targetHostId, direction, sourcePath, targetPath }) => {
+      const MAX_DIFF_BYTES = 256 * 1024
+      const sourceSide: Side = reqSrcSide || (direction === 'upload' ? 'local' : 'remote')
+      const targetSide: Side = reqDstSide || (direction === 'download' ? 'local' : 'remote')
+      const srcTransport = sourceSide === 'remote' ? await resolveActiveTransport(sourceHostId || hostId) : null
+      const dstTransport = targetSide === 'remote' ? await resolveActiveTransport(targetHostId || hostId) : null
 
-    let sourceBuf: Buffer
-    let targetBuf: Buffer
-    let sourceSize = 0
-    let targetSize = 0
+      let sourceBuf: Buffer
+      let targetBuf: Buffer
+      let sourceSize = 0
+      let targetSize = 0
 
-    try {
-      if (direction === 'upload') {
-        const [sStat, tStat] = await Promise.all([stat(sourcePath), transport.stat(targetPath)])
+      try {
+        const [sStat, tStat] = await Promise.all([
+          sourceSide === 'local' ? stat(sourcePath) : srcTransport!.stat(sourcePath),
+          targetSide === 'local' ? stat(targetPath) : dstTransport!.stat(targetPath)
+        ])
         sourceSize = sStat.size
         targetSize = tStat.size
         if (sourceSize > MAX_DIFF_BYTES || targetSize > MAX_DIFF_BYTES) {
           return { binary: false, tooLarge: true, sourceSize, targetSize, added: 0, removed: 0, lines: [] }
         }
         ;[sourceBuf, targetBuf] = await Promise.all([
-          readLocalBytes(sourcePath, MAX_DIFF_BYTES),
-          transport.readBytes(targetPath, MAX_DIFF_BYTES)
+          sourceSide === 'local'
+            ? readLocalBytes(sourcePath, MAX_DIFF_BYTES)
+            : srcTransport!.readBytes(sourcePath, MAX_DIFF_BYTES),
+          targetSide === 'local'
+            ? readLocalBytes(targetPath, MAX_DIFF_BYTES)
+            : dstTransport!.readBytes(targetPath, MAX_DIFF_BYTES)
         ])
-      } else {
-        const [sStat, tStat] = await Promise.all([transport.stat(sourcePath), stat(targetPath)])
-        sourceSize = sStat.size
-        targetSize = tStat.size
-        if (sourceSize > MAX_DIFF_BYTES || targetSize > MAX_DIFF_BYTES) {
-          return { binary: false, tooLarge: true, sourceSize, targetSize, added: 0, removed: 0, lines: [] }
-        }
-        ;[sourceBuf, targetBuf] = await Promise.all([
-          transport.readBytes(sourcePath, MAX_DIFF_BYTES),
-          readLocalBytes(targetPath, MAX_DIFF_BYTES)
-        ])
+      } catch (err) {
+        throw new Error(err instanceof Error ? err.message : 'Falha ao ler arquivos para comparação.')
       }
-    } catch (err) {
-      throw new Error(err instanceof Error ? err.message : 'Falha ao ler arquivos para comparação.')
-    }
 
-    if (looksBinary(sourceBuf) || looksBinary(targetBuf)) {
-      return { binary: true, sourceSize, targetSize, added: 0, removed: 0, lines: [] }
-    }
+      if (looksBinary(sourceBuf) || looksBinary(targetBuf)) {
+        return { binary: true, sourceSize, targetSize, added: 0, removed: 0, lines: [] }
+      }
 
-    const diff = computeLineDiff(targetBuf.toString('utf8'), sourceBuf.toString('utf8'))
-    return {
-      binary: false,
-      sourceSize,
-      targetSize,
-      added: diff.added,
-      removed: diff.removed,
-      truncated: diff.truncated,
-      lines: diff.lines
+      const diff = computeLineDiff(targetBuf.toString('utf8'), sourceBuf.toString('utf8'))
+      return {
+        binary: false,
+        sourceSize,
+        targetSize,
+        added: diff.added,
+        removed: diff.removed,
+        truncated: diff.truncated,
+        lines: diff.lines
+      }
     }
-  })
+  )
 
-  handle('transfers.enqueue', async ({ hostId, direction, items, priority }) => {
-    const targetHostId = hostId || connectionStatus.hostId
-    if (!targetHostId) {
-      throw new Error('Conecte-se a um host remoto antes de iniciar transferências.')
+  handle(
+    'transfers.enqueue',
+    async ({ hostId, sourceSide: reqSrcSide, sourceHostId, targetSide: reqDstSide, targetHostId, direction, items, priority }) => {
+      const sourceSide: Side = reqSrcSide || (direction === 'upload' ? 'local' : 'remote')
+      const targetSide: Side = reqDstSide || (direction === 'download' ? 'local' : 'remote')
+      const resolvedSrcHostId =
+        sourceSide === 'remote' ? sourceHostId || hostId || connectionStatus.hostId || undefined : undefined
+      const resolvedDstHostId =
+        targetSide === 'remote' ? targetHostId || hostId || connectionStatus.hostId || undefined : undefined
+
+      if (sourceSide === 'remote' && !resolvedSrcHostId) {
+        throw new Error('Conecte-se ao host de origem antes de iniciar transferências.')
+      }
+      if (targetSide === 'remote' && !resolvedDstHostId) {
+        throw new Error('Conecte-se ao host de destino antes de iniciar transferências.')
+      }
+
+      const srcProfile = resolvedSrcHostId ? await getHostProfile(resolvedSrcHostId) : null
+      const dstProfile = resolvedDstHostId ? await getHostProfile(resolvedDstHostId) : null
+      const primaryProfile = dstProfile || srcProfile
+      if (!primaryProfile) {
+        throw new Error('Selecione ao menos um host remoto para transferir.')
+      }
+
+      const snapshot = transferManager.enqueue({
+        hostId: primaryProfile.id,
+        hostName: primaryProfile.name,
+        sourceSide,
+        sourceHostId: srcProfile?.id,
+        sourceHostName: srcProfile?.name,
+        targetSide,
+        targetHostId: dstProfile?.id,
+        targetHostName: dstProfile?.name,
+        direction,
+        items,
+        priority
+      })
+      return { snapshot }
     }
-    const profile = await getHostProfile(targetHostId)
-    const snapshot = transferManager.enqueue({
-      hostId: profile.id,
-      hostName: profile.name,
-      direction,
-      items,
-      priority
-    })
-    return { snapshot }
-  })
+  )
 
   handle('transfers.list', async () => ({
     snapshot: transferManager.getSnapshot()
@@ -972,14 +1274,59 @@ export default function activate(orca: OrcaWorkerApi): void {
     return `${hosts.length} host(s) descoberto(s) na Orca e ~/.ssh/config.`
   })
 
+  // Background auto-sync with Orca's live hosts (picks up new, connected, reconnecting or disconnected hosts automatically)
+  let hostPollBusy = false
+  let lastHostsSignature = ''
+  if (activeHostPollTimer) clearInterval(activeHostPollTimer)
+  activeHostPollTimer = setInterval(() => {
+    if (hostPollBusy || !cachedHosts.length) return
+    hostPollBusy = true
+    void (async () => {
+      try {
+        const bindings = await loadSavedBindings()
+        const fresh = await discoverAllHosts(bindings)
+        const prevStatesSig = JSON.stringify(getHostStatesSnapshot())
+        const sig = JSON.stringify(
+          fresh.map((h) => [h.id, h.name, h.orcaStatus, h.hostname, h.orcaVpnHost, h.needsSshBinding])
+        )
+        cachedHosts = fresh
+        const stateChanged = syncOrcaHostStates(fresh)
+        const nextStatesSnap = getHostStatesSnapshot()
+        const nextStatesSig = JSON.stringify(nextStatesSnap)
+        if (sig !== lastHostsSignature) {
+          lastHostsSignature = sig
+          post('hosts.updated', { hosts: fresh })
+        }
+        if (stateChanged || nextStatesSig !== prevStatesSig) {
+          refreshLegacyConnectionStatus()
+          post('hostStates.updated', nextStatesSnap)
+          post('connection.updated', connectionStatus)
+          updateStatusBar(transferManager.getSnapshot())
+        }
+      } catch {
+        // Ignore transient Orca CLI poll errors
+      } finally {
+        hostPollBusy = false
+      }
+    })()
+  }, 10_000)
+  activeHostPollTimer.unref?.()
+
   orca.log('SFTP Bridge worker activated')
 }
 
 export async function deactivate(): Promise<void> {
+  if (activeHostPollTimer) {
+    clearInterval(activeHostPollTimer)
+    activeHostPollTimer = null
+  }
   for (const t of activeTails.values()) t.stop()
   activeTails.clear()
   activeManager?.shutdown()
-  activeTransport?.destroy()
-  activeTransport = null
+  if (activeTransportsRef) {
+    for (const t of activeTransportsRef.values()) t.destroy()
+    activeTransportsRef.clear()
+  }
+  activeTransportsRef = null
   activeManager = null
 }

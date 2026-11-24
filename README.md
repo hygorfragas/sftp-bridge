@@ -7,11 +7,17 @@ Ponte SFTP integrada à sidebar da **Orca IDE** com suporte unificado para:
 
 ## Recursos
 
+- **Local ⇄ Remoto e Remoto A ⇄ Remoto B (multi-sessão):**
+  - Abre por padrão em **`Local × Remoto`**, mas ao passar o mouse no cabeçalho de qualquer painel (`LOCAL ⌄` ou `REMOTO ⌄`), você pode trocar a origem para qualquer outro servidor e transferir arquivos diretamente **entre dois servidores remotos** (SSH, Servidor Orca Remoto via VPN/Túnel ou manual, em qualquer direção).
+  - Transferências **Remoto ⇄ Remoto** fazem streaming direto em memória (blocos de 64 KB) sem arquivos temporários no disco local, mantendo **pause/resume exato**, **Diff visual** e **backup `.bak`**.
+- **Sincronização automática com a Orca + Gerenciador de Conexões:**
+  - Hosts e Servidores Orca Remotos já conectados na Orca ficam automaticamente prontos (🟢) no SFTP Bridge, com sincronização em segundo plano (detecta novos hosts, reconexões e desconexões automaticamente).
+  - Gerenciador dedicado de **Conexões e Hosts SFTP (`🖥️`)** e **Central Rápida (`⚡` / Status Bar)** com barra superior sempre fixa, status real ao vivo (🟢 conectado · 🟡 reconectando · 🔴 desconectado) e indicadores `Esq`/`Dir` dos hosts em uso.
 - **Responsividade inteligente (Abas ↔ Menu ↔ Dividido):**
-  - **Modo Dividido (`>= 520px`, estilo Electerm):** painéis Local e Remoto lado a lado com divisor redimensionável, **Navegação Sincronizada (`🔗 Sync`)**, drag-and-drop entre painéis, **arrastar direto do Finder do macOS** para upload e botão/gaveta de transferências em destaque.
+  - **Modo Dividido (`>= 520px`, estilo Electerm):** painéis lado a lado com divisor redimensionável, **Navegação Sincronizada (`🔗 Sync`)**, drag-and-drop entre painéis, **arrastar direto do Finder do macOS** para upload e botão/gaveta de transferências em destaque.
   - **Modo Abas (`< 520px` ou manual):** `Local` | `Remoto` | `Transferências` com badge/ponto vermelho dinâmico; abaixo de `310px` as abas viram um menu dropdown compacto.
-- **Persistência completa de sessão:** lembra último host selecionado/conectado, pastas Local e Remota por host, layout, divisor e estado do `Sync` ao sair e voltar ao painel.
-- **Segurança máxima contra sobrescrita:** detecção automática de conflitos em uploads e downloads com **Diff visual linha a linha**, opção **Criar backup `.bak` antes de substituir**, **Renomear e manter ambos** ou **Pular conflitantes**.
+- **Persistência completa de sessão:** lembra os endpoints dos dois painéis, pastas Local e Remota por host, layout, divisor e estado do `Sync` ao sair e voltar ao painel.
+- **Segurança máxima contra sobrescrita:** detecção automática de conflitos em uploads, downloads e transferências remoto-a-remoto com **Diff visual linha a linha**, opção **Criar backup `.bak` antes de substituir**, **Renomear e manter ambos** ou **Pular conflitantes**.
 - **Fila de Transferências completa:** pausar, iniciar/retomar do byte exato (`.orca-sftp.part`), parar/cancelar, prioridade (`Alta`, `Normal`, `Baixa`), reordenação (`Topo`, `Subir`, `Descer`), velocidade, ETA e item na Status Bar da Orca.
 - **Busca recursiva em subpastas (`Subpastas`):** localiza arquivos em diretórios profundos tanto no Local quanto no Remoto (`find`) e abre direto no editor ou preview.
 - **Visualizador de Logs ao Vivo (`tail -f`):** acompanhe logs remotos ou locais em streaming com filtro em tempo real, pausa de scroll e quebra de linha.

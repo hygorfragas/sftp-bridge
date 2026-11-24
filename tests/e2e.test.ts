@@ -381,7 +381,7 @@ test('E2E: full SFTP lifecycle, errors, capabilities, Finder chunked upload, dif
     assert.ok(worker.posts.some((p) => p.event === 'workspace.hint'))
 
     // 9. Disconnect & delete host (cleans binding + secret)
-    await worker.request('connection.disconnect')
+    await worker.request('connection.disconnect', {})
     await worker.request('hosts.delete', { hostId: saved.host.id })
 
     // 10. Least-privilege check: zero capability refusals!
@@ -391,5 +391,126 @@ test('E2E: full SFTP lifecycle, errors, capabilities, Finder chunked upload, dif
   } finally {
     await sftpSrv.close()
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('E2E: multi-host live hostStates + Remote A <-> Remote B streaming transfer, diff & .bak', async () => {
+  const srvA = await startTestSftpServer()
+  const srvB = await startTestSftpServer()
+  srvA.files.set('/root/deploy.yml', {
+    data: Buffer.from('version: 2\nservice: alpha\n'),
+    mode: 0o100644,
+    mtimeSec: Math.floor(Date.now() / 1000)
+  })
+  srvB.files.set('/root/deploy.yml', {
+    data: Buffer.from('version: 1\nservice: beta\n'),
+    mode: 0o100644,
+    mtimeSec: Math.floor(Date.now() / 1000)
+  })
+
+  try {
+    const worker = await mountWorker(workerMod, {
+      host: mockHost({
+        results: {
+          'statusBar.update': { ok: true },
+          'notifications.show': { delivered: true }
+        }
+      })
+    })
+
+    // Save two independent SSH2 hosts (Alpha & Beta)
+    const savedA = await worker.request('hosts.save', {
+      name: 'Alpha Box',
+      hostname: '127.0.0.1',
+      port: srvA.port,
+      username: 'tester',
+      authMethod: 'password',
+      password: srvA.password,
+      defaultRemotePath: '/root'
+    })
+    const savedB = await worker.request('hosts.save', {
+      name: 'Beta Box',
+      hostname: '127.0.0.1',
+      port: srvB.port,
+      username: 'tester',
+      authMethod: 'password',
+      password: srvB.password,
+      defaultRemotePath: '/root'
+    })
+
+    // Connect both simultaneously and verify real per-host live states
+    const connA = await worker.request('connection.connect', { hostId: savedA.host.id })
+    assert.equal(connA.hostState.state, 'connected')
+    assert.equal(connA.hostStates[savedA.host.id]?.state, 'connected')
+    assert.equal(connA.hostStates[savedB.host.id]?.state, undefined)
+
+    const connB = await worker.request('connection.connect', { hostId: savedB.host.id })
+    assert.equal(connB.hostStates[savedA.host.id]?.state, 'connected')
+    assert.equal(connB.hostStates[savedB.host.id]?.state, 'connected')
+
+    // Conflict check + Diff directly between Remote A and Remote B!
+    const conflicts = await worker.request('transfers.checkConflicts', {
+      direction: 'remote-to-remote',
+      sourceSide: 'remote',
+      sourceHostId: savedA.host.id,
+      targetSide: 'remote',
+      targetHostId: savedB.host.id,
+      items: [
+        {
+          sourcePath: '/root/deploy.yml',
+          targetDir: '/root',
+          isDirectory: false,
+          name: 'deploy.yml',
+          size: 26
+        }
+      ]
+    })
+    assert.equal(conflicts.conflicts.length, 1)
+
+    const diff = await worker.request('transfers.diffConflict', {
+      direction: 'remote-to-remote',
+      sourceSide: 'remote',
+      sourceHostId: savedA.host.id,
+      targetSide: 'remote',
+      targetHostId: savedB.host.id,
+      sourcePath: '/root/deploy.yml',
+      targetPath: '/root/deploy.yml'
+    })
+    assert.equal(diff.binary, false)
+    assert.ok(diff.added >= 1 && diff.removed >= 1)
+
+    // Transfer Remote A -> Remote B with .bak backup
+    await worker.request('transfers.enqueue', {
+      direction: 'remote-to-remote',
+      sourceSide: 'remote',
+      sourceHostId: savedA.host.id,
+      targetSide: 'remote',
+      targetHostId: savedB.host.id,
+      items: [
+        {
+          sourcePath: '/root/deploy.yml',
+          targetDir: '/root',
+          isDirectory: false,
+          name: 'deploy.yml',
+          backupBeforeOverwrite: true,
+          size: 26
+        }
+      ]
+    })
+    await waitUntil(async () => (await worker.request('transfers.list')).snapshot.completedCount >= 1)
+    assert.equal(srvB.files.get('/root/deploy.yml')?.data.toString('utf8'), 'version: 2\nservice: alpha\n')
+    assert.equal(srvB.files.get('/root/deploy.yml.bak')?.data.toString('utf8'), 'version: 1\nservice: beta\n')
+
+    // Disconnecting ONLY Alpha keeps Beta connected!
+    const discA = await worker.request('connection.disconnect', { hostId: savedA.host.id })
+    assert.equal(discA.hostStates[savedA.host.id]?.state, 'disconnected')
+    assert.equal(discA.hostStates[savedB.host.id]?.state, 'connected')
+
+    await worker.request('connection.disconnect', {})
+    assert.equal(worker.refusals.length, 0)
+    await worker.deactivate()
+  } finally {
+    await srvA.close()
+    await srvB.close()
   }
 })

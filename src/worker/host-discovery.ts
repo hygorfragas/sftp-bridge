@@ -122,6 +122,16 @@ function normalizeName(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '')
 }
 
+function parseOrcaStatus(item?: OrcaHostListItem): 'connected' | 'connecting' | 'disconnected' {
+  if (!item) return 'disconnected'
+  const raw = (item.connectionStatus || '').toLowerCase()
+  if (raw === 'connecting' || raw === 'reconnecting' || raw === 'starting' || raw === 'initializing') {
+    return 'connecting'
+  }
+  if (item.connected === true || raw === 'connected') return 'connected'
+  return 'disconnected'
+}
+
 async function runOrcaCliJson<T>(args: string[]): Promise<T | null> {
   const candidates = [
     process.env.ORCA_CLI_COMMAND,
@@ -192,12 +202,14 @@ export function mergeDiscoveredHosts(params: {
     usedSshAliases.add(h.name)
     if (cfg) usedSshAliases.add(cfg.alias)
 
+    const orcaStatus = parseOrcaStatus(h)
     profiles.push({
       id: `orca-ssh:${h.id}`,
       name: h.name,
       kind: 'orca-ssh',
-      sourceLabel: h.connected ? 'Orca SSH · Conectado' : 'Orca SSH',
-      connected: Boolean(h.connected),
+      sourceLabel: orcaStatus === 'connected' ? 'Orca SSH · Conectado' : orcaStatus === 'connecting' ? 'Orca SSH · Conectando' : 'Orca SSH',
+      connected: orcaStatus === 'connected',
+      orcaStatus,
       sshAlias: binding?.sshAlias || cfg?.alias || h.name,
       hostname: binding?.hostname || cfg?.hostname || h.name,
       port: binding?.port || cfg?.port || 22,
@@ -239,6 +251,14 @@ export function mergeDiscoveredHosts(params: {
     const resolvedUsername = binding?.username || cfgMatch?.user
     const hasUsableTransport = Boolean(binding || resolvedAlias || vpnHost)
 
+    const envOrcaStatus: 'connected' | 'connecting' | 'disconnected' = linkedSsh
+      ? parseOrcaStatus(linkedSsh)
+      : h.connectionStatus || typeof h.connected === 'boolean'
+        ? parseOrcaStatus(h)
+        : vpnHost && hasUsableTransport
+          ? 'connected'
+          : 'disconnected'
+
     profiles.push({
       id: `orca-env:${h.id}`,
       name: h.name,
@@ -248,7 +268,8 @@ export function mergeDiscoveredHosts(params: {
         : vpnHost
           ? `Orca Remoto · VPN (${vpnHost})`
           : 'Orca Remoto',
-      connected: Boolean(linkedSsh?.connected ?? true),
+      connected: envOrcaStatus === 'connected',
+      orcaStatus: envOrcaStatus,
       sshAlias: resolvedAlias,
       hostname: resolvedHostname,
       port: binding?.port || cfgMatch?.port || 22,

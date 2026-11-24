@@ -6,6 +6,7 @@ import type {
   ConflictDiffResult,
   FileEntry,
   HostProfile,
+  PaneId,
   SaveHostInput,
   Side,
   TransferConflict,
@@ -15,17 +16,19 @@ import type {
 
 export type ModalState =
   | null
-  | { kind: 'host'; initial?: Partial<HostProfile> }
-  | { kind: 'mkdir'; side: Side }
-  | { kind: 'newFile'; side: Side }
-  | { kind: 'rename'; side: Side; entry: FileEntry }
-  | { kind: 'chmod'; side: Side; entry: FileEntry }
-  | { kind: 'compress'; side: Side; entries: FileEntry[]; defaultFormat: ArchiveFormat }
-  | { kind: 'delete'; side: Side; entries: FileEntry[] }
+  | { kind: 'host'; initial?: Partial<HostProfile>; attachToPane?: PaneId }
+  | { kind: 'mkdir'; paneId: PaneId; side: Side }
+  | { kind: 'newFile'; paneId: PaneId; side: Side }
+  | { kind: 'rename'; paneId: PaneId; side: Side; entry: FileEntry }
+  | { kind: 'chmod'; paneId: PaneId; side: Side; entry: FileEntry }
+  | { kind: 'compress'; paneId: PaneId; side: Side; entries: FileEntry[]; defaultFormat: ArchiveFormat }
+  | { kind: 'delete'; paneId: PaneId; side: Side; entries: FileEntry[] }
   | {
       kind: 'conflict'
-      fromSide: Side
+      fromPane: PaneId
       direction: TransferDirection
+      sourceLabel: string
+      targetLabel: string
       entries: FileEntry[]
       conflicts: TransferConflict[]
       priority: TransferPriority
@@ -420,6 +423,8 @@ export function ConfirmDeleteModal({
 
 export function ConflictModal({
   direction,
+  sourceLabel,
+  targetLabel,
   totalCount,
   conflicts,
   onRequestDiff,
@@ -429,6 +434,8 @@ export function ConflictModal({
   onClose
 }: {
   direction: TransferDirection
+  sourceLabel?: string
+  targetLabel?: string
   totalCount: number
   conflicts: TransferConflict[]
   onRequestDiff: (conflict: TransferConflict) => Promise<ConflictDiffResult>
@@ -445,7 +452,16 @@ export function ConflictModal({
   const [openDiffPath, setOpenDiffPath] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const destLabel = direction === 'upload' ? 'no servidor remoto' : 'no diretório local'
+  const destLabel =
+    direction === 'upload'
+      ? 'no servidor remoto'
+      : direction === 'download'
+        ? 'no diretório local'
+        : targetLabel
+          ? `em ${targetLabel}`
+          : 'no servidor de destino'
+  const srcTag = sourceLabel || (direction === 'upload' ? 'Local' : 'Remoto')
+  const dstTag = targetLabel || (direction === 'upload' ? 'Remoto' : direction === 'download' ? 'Local' : 'Destino')
   const nonConflictingCount = Math.max(0, totalCount - conflicts.length)
 
   const runAction = async (fn: () => Promise<void>) => {
@@ -521,14 +537,14 @@ export function ConflictModal({
               </div>
               <div class="conflict-meta">
                 <div>
-                  <div>Origem ({direction === 'upload' ? 'Local' : 'Remoto'})</div>
+                  <div>Origem ({srcTag})</div>
                   <div>
                     {c.isDirectory ? 'Pasta' : formatBytes(c.sourceSize)}
                     {c.sourceMtimeMs ? ` · ${formatTimestamp(c.sourceMtimeMs)}` : ''}
                   </div>
                 </div>
                 <div>
-                  <div>Existente ({direction === 'upload' ? 'Remoto' : 'Local'})</div>
+                  <div>Existente ({dstTag})</div>
                   <div>
                     {c.targetIsDirectory ? 'Pasta' : formatBytes(c.targetSize)}
                     {c.targetMtimeMs ? ` · ${formatTimestamp(c.targetMtimeMs)}` : ''}

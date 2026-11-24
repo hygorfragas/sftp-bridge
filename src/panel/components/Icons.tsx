@@ -46,6 +46,8 @@ export function Icon({
     | 'arrows-up-down'
     | 'crosshair'
     | 'zap'
+    | 'server'
+    | 'network-folder'
   size?: number
   color?: string
 }) {
@@ -363,6 +365,25 @@ export function Icon({
       return (
         <svg {...common}>
           <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+        </svg>
+      )
+    case 'server':
+      return (
+        <svg {...common}>
+          <rect x="2" y="3" width="20" height="7" rx="2" />
+          <rect x="2" y="14" width="20" height="7" rx="2" />
+          <line x1="6" y1="6.5" x2="6.01" y2="6.5" />
+          <line x1="6" y1="17.5" x2="6.01" y2="17.5" />
+        </svg>
+      )
+    case 'network-folder':
+      return (
+        <svg {...common}>
+          <path d="M5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.2l1.6 1.8h6.2A1.5 1.5 0 0 1 19 7.3v5.2a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 12.5v-7Z" fill="currentColor" stroke="none" />
+          <path d="M12 13.5v3.5" strokeWidth={2} />
+          <path d="M7.5 19v-1.2a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1V19" strokeWidth={1.9} />
+          <circle cx="7.5" cy="19.5" r="2" fill="currentColor" stroke="none" />
+          <circle cx="16.5" cy="19.5" r="2" fill="currentColor" stroke="none" />
         </svg>
       )
   }

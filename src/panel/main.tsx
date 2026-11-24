@@ -2,23 +2,29 @@ import { render } from 'preact'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import '../protocol.ts'
 import { formatModeOctal, posixBasename, posixDirname, posixJoin } from '../shared/file-utils.ts'
+import { deduplicateHostsForDisplay } from '../shared/host-display.ts'
 import type {
   ArchiveFormat,
   BookmarkEntry,
   ConnectionStatus,
   EditorFilePayload,
   FileEntry,
+  HostConnectionState,
   HostProfile,
+  HostSftpState,
   ImagePreviewPayload,
   LayoutMode,
+  PaneEndpoint,
+  PaneId,
   PluginUserSettings,
   SaveHostInput,
   SearchResultEntry,
-  Side,
+  TransferDirection,
   TransferPriority,
   TransferSnapshot,
   WorkspaceHint
 } from '../shared/types.ts'
+import { ConnectionsManager } from './components/ConnectionsManager.tsx'
 import { ContextMenu, type ContextMenuState } from './components/ContextMenu.tsx'
 import { FilePane } from './components/FilePane.tsx'
 import { Icon } from './components/Icons.tsx'
@@ -37,6 +43,28 @@ import { QuickHubPopover } from './components/QuickHubPopover.tsx'
 import { TransferPanel } from './components/TransferPanel.tsx'
 
 type ActiveTab = 'local' | 'remote' | 'transfers'
+
+interface PaneState {
+  endpoint: PaneEndpoint | null
+  path: string
+  homePath: string
+  entries: FileEntry[]
+  loading: boolean
+  error: string | null
+  selected: Set<string>
+  showHidden: boolean
+}
+
+const EMPTY_PANE: PaneState = {
+  endpoint: null,
+  path: '',
+  homePath: '.',
+  entries: [],
+  loading: false,
+  error: null,
+  selected: new Set(),
+  showHidden: true
+}
 
 const EMPTY_TRANSFERS: TransferSnapshot = {
   items: [],
@@ -85,12 +113,22 @@ function applyTypographyVars(typo: { cssFontFamily?: string; fontSize?: number; 
   if (typo.lineHeight) root.setProperty('--editor-line-height', String(typo.lineHeight))
 }
 
+function dotClassForState(state: HostConnectionState): string {
+  if (state === 'connected') return 'connected'
+  if (state === 'connecting') return 'connecting'
+  return 'disconnected'
+}
+
+function otherPaneId(pane: PaneId): PaneId {
+  return pane === 'left' ? 'right' : 'left'
+}
+
 function App() {
   const [layout, setLayout] = useState<LayoutMode>('tabs')
   const [activeTab, setActiveTab] = useState<ActiveTab>('local')
   const [settings, setSettings] = useState<PluginUserSettings>(DEFAULT_SETTINGS)
   const [hosts, setHosts] = useState<HostProfile[]>([])
-  const [selectedHostId, setSelectedHostId] = useState<string>('')
+  const [hostStates, setHostStates] = useState<Record<string, HostSftpState>>({})
   const [connection, setConnection] = useState<ConnectionStatus>({
     hostId: null,
     hostName: null,
@@ -105,32 +143,26 @@ function App() {
     hostId: null,
     workspaceName: null
   })
-
-  // Local pane state
   const [localHome, setLocalHome] = useState('')
-  const [localPath, setLocalPath] = useState('')
-  const [localEntries, setLocalEntries] = useState<FileEntry[]>([])
-  const [localLoading, setLocalLoading] = useState(false)
-  const [localError, setLocalError] = useState<string | null>(null)
-  const [localSelected, setLocalSelected] = useState<Set<string>>(new Set())
-  const [showHiddenLocal, setShowHiddenLocal] = useState(true)
 
-  // Remote pane state
-  const [remoteHome, setRemoteHome] = useState('.')
-  const [remotePath, setRemotePath] = useState('')
-  const [remoteEntries, setRemoteEntries] = useState<FileEntry[]>([])
-  const [remoteLoading, setRemoteLoading] = useState(false)
-  const [remoteError, setRemoteError] = useState<string | null>(null)
-  const [remoteSelected, setRemoteSelected] = useState<Set<string>>(new Set())
-  const [showHiddenRemote, setShowHiddenRemote] = useState(true)
+  // Dual symmetric panes — defaults to Local (left) × Remote (right)
+  const [leftPane, setLeftPane] = useState<PaneState>({
+    ...EMPTY_PANE,
+    endpoint: { kind: 'local' }
+  })
+  const [rightPane, setRightPane] = useState<PaneState>({
+    ...EMPTY_PANE,
+    endpoint: null
+  })
 
   // UI overlays & split sizing
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
-  const [editorFile, setEditorFile] = useState<EditorFilePayload | null>(null)
-  const [previewImage, setPreviewImage] = useState<ImagePreviewPayload | null>(null)
+  const [editorState, setEditorState] = useState<{ paneId: PaneId; file: EditorFilePayload } | null>(null)
+  const [previewState, setPreviewState] = useState<{ paneId: PaneId; image: ImagePreviewPayload } | null>(null)
   const [tailSession, setTailSession] = useState<ActiveTailSession | null>(null)
   const [syncBrowsing, setSyncBrowsing] = useState(false)
   const [hubOpen, setHubOpen] = useState(false)
+  const [connectionsOpen, setConnectionsOpen] = useState(false)
   const [modal, setModal] = useState<ModalState>(null)
   const [toast, setToast] = useState<{ text: string; isError?: boolean } | null>(null)
   const [splitRatio, setSplitRatio] = useState(50)
@@ -144,82 +176,292 @@ function App() {
   const compactMenuRef = useRef<HTMLDivElement>(null)
   const prevCompletedRef = useRef(0)
 
+  // Live refs so async callbacks never read stale pane/host state
+  const leftPaneRef = useRef(leftPane)
+  leftPaneRef.current = leftPane
+  const rightPaneRef = useRef(rightPane)
+  rightPaneRef.current = rightPane
+  const hostsRef = useRef(hosts)
+  hostsRef.current = hosts
+  const hostStatesRef = useRef(hostStates)
+  hostStatesRef.current = hostStates
+  const localHomeRef = useRef(localHome)
+  localHomeRef.current = localHome
+  const remotePathsByHostRef = useRef<Record<string, string>>({})
+  const lastLocalPathRef = useRef<string>('')
+
+  const getPane = useCallback(
+    (paneId: PaneId): PaneState => (paneId === 'left' ? leftPaneRef.current : rightPaneRef.current),
+    []
+  )
+
+  const patchPane = useCallback(
+    (paneId: PaneId, updater: Partial<PaneState> | ((prev: PaneState) => PaneState)) => {
+      const setter = paneId === 'left' ? setLeftPane : setRightPane
+      setter((prev) => (typeof updater === 'function' ? updater(prev) : { ...prev, ...updater }))
+    },
+    []
+  )
+
   const notify = useCallback((text: string, isError = false) => {
     setToast({ text, isError })
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), isError ? 4500 : 2800)
   }, [])
 
-  const loadLocal = useCallback(async (targetPath?: string) => {
-    setLocalLoading(true)
-    setLocalError(null)
-    try {
-      const res = await requestWorker('fs.list', { side: 'local', path: targetPath })
-      setLocalPath(res.path)
-      setLocalEntries(res.entries)
-      setLocalSelected(new Set())
-    } catch (err) {
-      setLocalError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLocalLoading(false)
-    }
-  }, [])
+  const getEndpointTitle = useCallback(
+    (endpoint: PaneEndpoint | null): string => {
+      if (!endpoint) return 'Remoto'
+      if (endpoint.kind === 'local') return 'Local'
+      const h = hostsRef.current.find((x) => x.id === endpoint.hostId)
+      return h?.name || hostStatesRef.current[endpoint.hostId]?.hostName || 'Remoto'
+    },
+    []
+  )
 
-  const loadRemote = useCallback(async (targetPath?: string, hostId?: string) => {
-    setRemoteLoading(true)
-    setRemoteError(null)
-    try {
-      const res = await requestWorker('fs.list', { side: 'remote', path: targetPath, hostId })
-      setRemotePath(res.path)
-      setRemoteEntries(res.entries)
-      setRemoteSelected(new Set())
-    } catch (err) {
-      setRemoteError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setRemoteLoading(false)
-    }
-  }, [])
+  const isEndpointConnected = useCallback(
+    (endpoint: PaneEndpoint | null, states: Record<string, HostSftpState> = hostStatesRef.current): boolean => {
+      if (!endpoint) return false
+      if (endpoint.kind === 'local') return true
+      return states[endpoint.hostId]?.state === 'connected'
+    },
+    []
+  )
 
-  const connectHost = useCallback(
-    async (hostId: string, overrideRemotePath?: string, silent = false) => {
-      const profile = hosts.find((h) => h.id === hostId)
-      if (profile?.needsSshBinding) {
-        setModal({ kind: 'host', initial: profile })
-        return
-      }
-      setSelectedHostId(hostId)
-      void requestWorker('session.save', { lastHostId: hostId }).catch(() => undefined)
-      setRemoteLoading(true)
-      setRemoteError(null)
+  const computeDirection = useCallback(
+    (from: PaneEndpoint | null, to: PaneEndpoint | null): TransferDirection | null => {
+      if (!from || !to) return null
+      if (from.kind === 'local' && to.kind === 'remote') return 'upload'
+      if (from.kind === 'remote' && to.kind === 'local') return 'download'
+      if (from.kind === 'remote' && to.kind === 'remote') return 'remote-to-remote'
+      return null
+    },
+    []
+  )
+
+  const loadPaneDirectory = useCallback(
+    async (paneId: PaneId, endpoint: PaneEndpoint, targetPath?: string) => {
+      patchPane(paneId, { loading: true, error: null })
       try {
-        const res = await requestWorker('connection.connect', { hostId })
-        setConnection(res.connection)
-        setRemoteHome(res.connection.remoteHome || res.remotePath)
-        if (overrideRemotePath) {
-          await loadRemote(overrideRemotePath, hostId)
+        const res = await requestWorker('fs.list', {
+          side: endpoint.kind,
+          path: targetPath,
+          hostId: endpoint.kind === 'remote' ? endpoint.hostId : undefined
+        })
+        if (endpoint.kind === 'local') {
+          lastLocalPathRef.current = res.path
         } else {
-          setRemotePath(res.remotePath)
-          setRemoteEntries(res.entries)
-          setRemoteSelected(new Set())
+          remotePathsByHostRef.current[endpoint.hostId] = res.path
         }
-        if (!silent) notify(`Conectado a ${res.connection.hostName}`)
+        patchPane(paneId, {
+          path: res.path,
+          entries: res.entries,
+          selected: new Set(),
+          loading: false,
+          error: null
+        })
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        setRemoteError(msg)
-        if (!silent) {
-          notify(msg, true)
-          if (
-            profile &&
-            /permission denied|authentication|publickey|passphrase|senha/i.test(msg)
-          ) {
-            setModal({ kind: 'host', initial: profile })
-          }
-        }
-      } finally {
-        setRemoteLoading(false)
+        patchPane(paneId, {
+          loading: false,
+          error: err instanceof Error ? err.message : String(err)
+        })
       }
     },
-    [hosts, loadRemote, notify]
+    [patchPane]
+  )
+
+  const connectHostById = useCallback(
+    async (
+      hostId: string,
+      opts?: {
+        forceReconnect?: boolean
+        attachToPane?: PaneId
+        overrideRemotePath?: string
+        silent?: boolean
+      }
+    ) => {
+      const profile = hostsRef.current.find((h) => h.id === hostId)
+      if (profile?.needsSshBinding) {
+        setModal({ kind: 'host', initial: profile, attachToPane: opts?.attachToPane || 'right' })
+        return
+      }
+
+      if (opts?.attachToPane) {
+        const ep: PaneEndpoint = { kind: 'remote', hostId }
+        patchPane(opts.attachToPane, {
+          endpoint: ep,
+          loading: true,
+          error: null,
+          entries: [],
+          selected: new Set()
+        })
+        void requestWorker(
+          'session.save',
+          opts.attachToPane === 'left'
+            ? { leftEndpoint: ep, lastHostId: hostId }
+            : { rightEndpoint: ep, lastHostId: hostId }
+        ).catch(() => undefined)
+      }
+
+      // Optimistically show yellow connecting dot immediately
+      setHostStates((prev) => ({
+        ...prev,
+        [hostId]: {
+          hostId,
+          hostName: profile?.name || prev[hostId]?.hostName || hostId,
+          state: 'connecting'
+        }
+      }))
+
+      try {
+        const res = await requestWorker('connection.connect', {
+          hostId,
+          forceReconnect: opts?.forceReconnect
+        })
+        setConnection(res.connection)
+        setHostStates(res.hostStates)
+        hostStatesRef.current = res.hostStates
+        remotePathsByHostRef.current[hostId] = res.remotePath
+
+        const homePath = res.hostState.remoteHome || res.connection.remoteHome || res.remotePath
+        const targetPanes = new Set<PaneId>()
+        if (opts?.attachToPane) targetPanes.add(opts.attachToPane)
+
+        const leftEp = leftPaneRef.current.endpoint
+        const rightEp = rightPaneRef.current.endpoint
+        if (leftEp?.kind === 'remote' && leftEp.hostId === hostId) targetPanes.add('left')
+        if (rightEp?.kind === 'remote' && rightEp.hostId === hostId) targetPanes.add('right')
+
+        // If user connected from Connections Manager / QuickHub without specifying a pane,
+        // and right pane isn't currently connected to another host, attach to right pane automatically
+        if (
+          targetPanes.size === 0 &&
+          (!rightEp || (rightEp.kind === 'remote' && !isEndpointConnected(rightEp, res.hostStates)))
+        ) {
+          targetPanes.add('right')
+          const ep: PaneEndpoint = { kind: 'remote', hostId }
+          void requestWorker('session.save', { rightEndpoint: ep, lastHostId: hostId }).catch(() => undefined)
+        }
+
+        for (const paneId of targetPanes) {
+          const ep: PaneEndpoint = { kind: 'remote', hostId }
+          patchPane(paneId, {
+            endpoint: ep,
+            homePath,
+            error: null
+          })
+          if (opts?.overrideRemotePath) {
+            await loadPaneDirectory(paneId, ep, opts.overrideRemotePath)
+          } else {
+            patchPane(paneId, {
+              path: res.remotePath,
+              entries: res.entries,
+              selected: new Set(),
+              loading: false,
+              error: null
+            })
+          }
+        }
+
+        if (!opts?.silent) {
+          notify(`Conectado a ${res.hostState.hostName}`)
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        setHostStates((prev) => ({
+          ...prev,
+          [hostId]: {
+            hostId,
+            hostName: profile?.name || prev[hostId]?.hostName || hostId,
+            state: 'error',
+            error: msg
+          }
+        }))
+        for (const paneId of ['left', 'right'] as PaneId[]) {
+          const ep = getPane(paneId).endpoint
+          if (ep?.kind === 'remote' && ep.hostId === hostId) {
+            patchPane(paneId, { loading: false, error: msg })
+          }
+        }
+        if (!opts?.silent) {
+          notify(msg, true)
+          if (profile && /permission denied|authentication|publickey|passphrase|senha/i.test(msg)) {
+            setModal({ kind: 'host', initial: profile, attachToPane: opts?.attachToPane })
+          }
+        }
+      }
+    },
+    [getPane, isEndpointConnected, loadPaneDirectory, notify, patchPane]
+  )
+
+  const disconnectHostById = useCallback(
+    async (hostId: string) => {
+      try {
+        const res = await requestWorker('connection.disconnect', { hostId })
+        setConnection(res.connection)
+        setHostStates(res.hostStates)
+        hostStatesRef.current = res.hostStates
+        for (const paneId of ['left', 'right'] as PaneId[]) {
+          const ep = getPane(paneId).endpoint
+          if (ep?.kind === 'remote' && ep.hostId === hostId) {
+            patchPane(paneId, { entries: [], selected: new Set(), error: null, loading: false })
+          }
+        }
+        const hostName = hostsRef.current.find((h) => h.id === hostId)?.name || hostId
+        notify(`Desconectado de ${hostName}`)
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), true)
+      }
+    },
+    [getPane, notify, patchPane]
+  )
+
+  const selectPaneEndpoint = useCallback(
+    async (paneId: PaneId, endpoint: PaneEndpoint) => {
+      void requestWorker(
+        'session.save',
+        paneId === 'left'
+          ? { leftEndpoint: endpoint, ...(endpoint.kind === 'remote' ? { lastHostId: endpoint.hostId } : {}) }
+          : { rightEndpoint: endpoint, ...(endpoint.kind === 'remote' ? { lastHostId: endpoint.hostId } : {}) }
+      ).catch(() => undefined)
+
+      if (endpoint.kind === 'local') {
+        const target = lastLocalPathRef.current || localHomeRef.current || undefined
+        patchPane(paneId, {
+          endpoint,
+          homePath: localHomeRef.current,
+          error: null,
+          selected: new Set()
+        })
+        await loadPaneDirectory(paneId, endpoint, target)
+        return
+      }
+
+      const live = hostStatesRef.current[endpoint.hostId]
+      if (live?.state === 'connected') {
+        const savedPath = remotePathsByHostRef.current[endpoint.hostId] || live.remoteHome || '.'
+        patchPane(paneId, {
+          endpoint,
+          homePath: live.remoteHome || '.',
+          error: null,
+          selected: new Set()
+        })
+        await loadPaneDirectory(paneId, endpoint, savedPath)
+      } else {
+        await connectHostById(endpoint.hostId, { attachToPane: paneId })
+      }
+    },
+    [connectHostById, loadPaneDirectory, patchPane]
+  )
+
+  const refreshPane = useCallback(
+    async (paneId: PaneId) => {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
+      if (pane.endpoint.kind === 'remote' && !isEndpointConnected(pane.endpoint)) return
+      await loadPaneDirectory(paneId, pane.endpoint, pane.path || pane.homePath)
+    },
+    [getPane, isEndpointConnected, loadPaneDirectory]
   )
 
   // Initial bootstrap + Orca events + resize listener
@@ -242,9 +484,15 @@ function App() {
     })
     const connSub = orca.plugin.on('connection.updated', (status) => {
       setConnection(status)
-      if (status.hostId) setSelectedHostId(status.hostId)
     })
-    const hostsSub = orca.plugin.on('hosts.updated', ({ hosts: next }) => setHosts(next))
+    const hostStatesSub = orca.plugin.on('hostStates.updated', (states) => {
+      setHostStates(states)
+      hostStatesRef.current = states
+    })
+    const hostsSub = orca.plugin.on('hosts.updated', ({ hosts: next }) => {
+      setHosts(next)
+      hostsRef.current = next
+    })
     const wsSub = orca.plugin.on('workspace.hint', (hint) => setWorkspaceHint(hint))
     const hubSub = orca.plugin.on('quickHub.toggle', (ev) => {
       setHubOpen((prev) => (typeof ev?.open === 'boolean' ? ev.open : !prev))
@@ -254,10 +502,12 @@ function App() {
       try {
         const boot = await requestWorker('app.bootstrap')
         setLocalHome(boot.localHome)
+        localHomeRef.current = boot.localHome
         setSettings(boot.settings)
-        setShowHiddenLocal(boot.settings.showHiddenFiles)
-        setShowHiddenRemote(boot.settings.showHiddenFiles)
         setHosts(boot.hosts)
+        hostsRef.current = boot.hosts
+        setHostStates(boot.hostStates)
+        hostStatesRef.current = boot.hostStates
         setConnection(boot.connection)
         setTransfers(boot.transfers)
         prevCompletedRef.current = boot.transfers.completedCount
@@ -265,9 +515,13 @@ function App() {
         setWorkspaceHint(boot.workspaceHint)
 
         const savedSession = boot.session
+        remotePathsByHostRef.current = { ...(savedSession.remotePathsByHost || {}) }
+
         const storedLayout =
           savedSession.layout || (await orca.storage.get('sftp.layout').catch(() => null))
-        setLayout(storedLayout === 'split' || storedLayout === 'tabs' ? storedLayout : boot.settings.defaultLayout)
+        setLayout(
+          storedLayout === 'split' || storedLayout === 'tabs' ? storedLayout : boot.settings.defaultLayout
+        )
         if (typeof savedSession.splitRatio === 'number') {
           setSplitRatio(Math.max(25, Math.min(75, savedSession.splitRatio)))
         }
@@ -278,38 +532,70 @@ function App() {
           setSyncBrowsing(savedSession.syncBrowsing)
         }
 
-        const initialLocal = savedSession.lastLocalPath || boot.workspaceHint.localPath || boot.localHome
-        await loadLocal(initialLocal)
-
         const hasHost = (id: string | null | undefined): id is string =>
           Boolean(id && boot.hosts.some((h) => h.id === id))
 
-        if (boot.connection.connected && boot.connection.hostId) {
-          setSelectedHostId(boot.connection.hostId)
-          setRemoteHome(boot.connection.remoteHome || '.')
-          const targetRemote =
-            savedSession.remotePathsByHost[boot.connection.hostId] || boot.connection.remoteHome || '.'
-          await loadRemote(targetRemote, boot.connection.hostId)
+        const resolveEndpoint = (
+          candidate: PaneEndpoint | null | undefined,
+          fallback: PaneEndpoint | null
+        ): PaneEndpoint | null => {
+          if (!candidate) return fallback
+          if (candidate.kind === 'local') return candidate
+          return hasHost(candidate.hostId) ? candidate : fallback
+        }
+
+        // Default is always Local (left) × Remote (right)
+        const initialLeftEp = resolveEndpoint(savedSession.leftEndpoint, { kind: 'local' })!
+        let fallbackRightEp: PaneEndpoint | null = null
+        if (boot.connection.connected && hasHost(boot.connection.hostId)) {
+          fallbackRightEp = { kind: 'remote', hostId: boot.connection.hostId }
         } else if (hasHost(savedSession.lastHostId)) {
-          setSelectedHostId(savedSession.lastHostId)
-          if (savedSession.wasConnected) {
-            // Auto-reconnect seamlessly to the exact host & folder user was on
-            try {
-              const res = await requestWorker('connection.connect', { hostId: savedSession.lastHostId })
-              setConnection(res.connection)
-              setRemoteHome(res.connection.remoteHome || res.remotePath)
-              setRemotePath(res.remotePath)
-              setRemoteEntries(res.entries)
-              setRemoteSelected(new Set())
-            } catch {
-              // Keep selectedHostId preserved so user can click Conectar without losing selection
+          fallbackRightEp = { kind: 'remote', hostId: savedSession.lastHostId }
+        } else if (hasHost(boot.workspaceHint.hostId)) {
+          fallbackRightEp = { kind: 'remote', hostId: boot.workspaceHint.hostId }
+        } else if (boot.hosts.length > 0) {
+          fallbackRightEp = { kind: 'remote', hostId: boot.hosts[0].id }
+        }
+        const initialRightEp = resolveEndpoint(savedSession.rightEndpoint, fallbackRightEp)
+
+        const initialLocalPath =
+          savedSession.lastLocalPath || boot.workspaceHint.localPath || boot.localHome
+        lastLocalPathRef.current = initialLocalPath
+
+        const initPane = async (paneId: PaneId, ep: PaneEndpoint | null) => {
+          patchPane(paneId, {
+            endpoint: ep,
+            showHidden: boot.settings.showHiddenFiles,
+            homePath: ep?.kind === 'local' ? boot.localHome : '.'
+          })
+          if (!ep) return
+
+          if (ep.kind === 'local') {
+            await loadPaneDirectory(paneId, ep, initialLocalPath)
+            return
+          }
+
+          const live = boot.hostStates[ep.hostId]
+          if (live?.state === 'connected') {
+            const targetRemote =
+              savedSession.remotePathsByHost[ep.hostId] || live.remoteHome || '.'
+            patchPane(paneId, { homePath: live.remoteHome || '.' })
+            await loadPaneDirectory(paneId, ep, targetRemote)
+          } else if (savedSession.wasConnected) {
+            const prof = boot.hosts.find((h) => h.id === ep.hostId)
+            if (prof && !prof.needsSshBinding) {
+              await connectHostById(ep.hostId, { attachToPane: paneId, silent: true })
             }
           }
-        } else if (hasHost(boot.workspaceHint.hostId)) {
-          setSelectedHostId(boot.workspaceHint.hostId)
-        } else if (boot.hosts.length > 0) {
-          setSelectedHostId(boot.hosts[0].id)
         }
+
+        // Sync resolved left/right endpoints to worker so bottom status bar always matches visible panes
+        void requestWorker('session.save', {
+          leftEndpoint: initialLeftEp,
+          rightEndpoint: initialRightEp
+        }).catch(() => undefined)
+
+        await Promise.all([initPane('left', initialLeftEp), initPane('right', initialRightEp)])
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), true)
       }
@@ -320,19 +606,20 @@ function App() {
       typoSub.dispose()
       txSub.dispose()
       connSub.dispose()
+      hostStatesSub.dispose()
       hostsSub.dispose()
       wsSub.dispose()
       hubSub.dispose()
     }
-  }, [loadLocal, loadRemote, notify])
+  }, [connectHostById, loadPaneDirectory, notify, patchPane])
 
-  // Refresh panes automatically when a transfer finishes
+  // Refresh connected panes automatically when transfers finish
   useEffect(() => {
     if (transfers.completedCount > 0 && transfers.activeCount === 0 && transfers.queuedCount === 0) {
-      if (localPath) void loadLocal(localPath)
-      if (connection.connected && remotePath) void loadRemote(remotePath)
+      void refreshPane('left')
+      void refreshPane('right')
     }
-  }, [transfers.completedCount, transfers.activeCount, transfers.queuedCount])
+  }, [transfers.completedCount, transfers.activeCount, transfers.queuedCount, refreshPane])
 
   // Close compact tab dropdown on outside click
   useEffect(() => {
@@ -388,91 +675,85 @@ function App() {
     notify(next ? 'Navegação sincronizada (🔗) ativada' : 'Navegação sincronizada desativada')
   }
 
-  const navigateSide = useCallback(
+  const navigatePane = useCallback(
     async (
-      side: Side,
+      paneId: PaneId,
       targetPath: string,
       relativeAction?: { kind: 'enter'; name: string } | { kind: 'up' }
     ) => {
-      if (side === 'local') {
-        await loadLocal(targetPath)
-        if (syncBrowsing && connection.connected && relativeAction && remotePath) {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
+      await loadPaneDirectory(paneId, pane.endpoint, targetPath)
+
+      if (syncBrowsing && relativeAction) {
+        const otherId = otherPaneId(paneId)
+        const other = getPane(otherId)
+        if (other.endpoint && isEndpointConnected(other.endpoint) && other.path) {
           const mirror =
             relativeAction.kind === 'enter'
-              ? posixJoin(remotePath, relativeAction.name)
-              : posixDirname(remotePath)
+              ? posixJoin(other.path, relativeAction.name)
+              : posixDirname(other.path)
           try {
-            const res = await requestWorker('fs.list', { side: 'remote', path: mirror })
-            setRemotePath(res.path)
-            setRemoteEntries(res.entries)
-            setRemoteSelected(new Set())
+            const res = await requestWorker('fs.list', {
+              side: other.endpoint.kind,
+              path: mirror,
+              hostId: other.endpoint.kind === 'remote' ? other.endpoint.hostId : undefined
+            })
+            if (other.endpoint.kind === 'local') lastLocalPathRef.current = res.path
+            else remotePathsByHostRef.current[other.endpoint.hostId] = res.path
+            patchPane(otherId, { path: res.path, entries: res.entries, selected: new Set() })
           } catch {
+            const otherName = getEndpointTitle(other.endpoint)
             notify(
               relativeAction.kind === 'enter'
-                ? `Sync: pasta "${relativeAction.name}" não existe no Remoto`
-                : 'Sync: não foi possível subir pasta no Remoto'
-            )
-          }
-        }
-      } else {
-        await loadRemote(targetPath)
-        if (syncBrowsing && relativeAction && localPath) {
-          const mirror =
-            relativeAction.kind === 'enter'
-              ? posixJoin(localPath, relativeAction.name)
-              : posixDirname(localPath)
-          try {
-            const res = await requestWorker('fs.list', { side: 'local', path: mirror })
-            setLocalPath(res.path)
-            setLocalEntries(res.entries)
-            setLocalSelected(new Set())
-          } catch {
-            notify(
-              relativeAction.kind === 'enter'
-                ? `Sync: pasta "${relativeAction.name}" não existe no Local`
-                : 'Sync: não foi possível subir pasta no Local'
+                ? `Sync: pasta "${relativeAction.name}" não existe em ${otherName}`
+                : `Sync: não foi possível subir pasta em ${otherName}`
             )
           }
         }
       }
     },
-    [connection.connected, loadLocal, loadRemote, localPath, notify, remotePath, syncBrowsing]
+    [getEndpointTitle, getPane, isEndpointConnected, loadPaneDirectory, notify, patchPane, syncBrowsing]
   )
 
   const openImagePreview = useCallback(
-    async (side: Side, entry: { path: string; name: string }) => {
+    async (paneId: PaneId, entry: { path: string; name: string }) => {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
       try {
         const img = await requestWorker('preview.readImage', {
-          side,
+          side: pane.endpoint.kind,
           path: entry.path,
-          hostId: side === 'remote' ? connection.hostId || undefined : undefined
+          hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
         })
-        setPreviewImage(img)
+        setPreviewState({ paneId, image: img })
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), true)
       }
     },
-    [connection.hostId, notify]
+    [getPane, notify]
   )
 
   const openLogTail = useCallback(
-    async (side: Side, entry: { path: string; name: string }) => {
+    async (paneId: PaneId, entry: { path: string; name: string }) => {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
       if (tailSession) {
         void requestWorker('tail.stop', { tailId: tailSession.tailId }).catch(() => undefined)
       }
       try {
         const res = await requestWorker('tail.start', {
-          side,
+          side: pane.endpoint.kind,
           path: entry.path,
-          hostId: side === 'remote' ? connection.hostId || undefined : undefined,
+          hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined,
           lines: 200
         })
-        setTailSession({ tailId: res.tailId, side, path: entry.path, name: entry.name })
+        setTailSession({ tailId: res.tailId, side: pane.endpoint.kind, path: entry.path, name: entry.name })
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), true)
       }
     },
-    [connection.hostId, notify, tailSession]
+    [getPane, notify, tailSession]
   )
 
   const closeLogTail = useCallback(() => {
@@ -482,45 +763,201 @@ function App() {
     void requestWorker('tail.stop', { tailId: id }).catch(() => undefined)
   }, [tailSession])
 
+  const openEditorForEntry = useCallback(
+    async (paneId: PaneId, entry: FileEntry, forceText = false) => {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
+      try {
+        const payload = await requestWorker('editor.read', {
+          side: pane.endpoint.kind,
+          path: entry.path,
+          hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined,
+          forceText
+        })
+        setEditorState({ paneId, file: payload })
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), true)
+      }
+    },
+    [getPane, notify]
+  )
+
+  const dispatchEnqueue = useCallback(
+    async (
+      fromPane: PaneId,
+      entries: FileEntry[],
+      priority: TransferPriority = 'normal',
+      renameMap?: Record<string, string>,
+      backupBeforeOverwrite = false
+    ) => {
+      const srcPane = getPane(fromPane)
+      const dstPane = getPane(otherPaneId(fromPane))
+      const srcEp = srcPane.endpoint
+      const dstEp = dstPane.endpoint
+      const direction = computeDirection(srcEp, dstEp)
+
+      if (!srcEp || !dstEp || !direction) {
+        notify('Selecione ao menos um servidor remoto para transferir arquivos.', true)
+        return
+      }
+      if (!isEndpointConnected(srcEp) || !isEndpointConnected(dstEp)) {
+        notify('Conecte os servidores envolvidos antes de transferir arquivos.', true)
+        return
+      }
+      if (!entries.length) return
+
+      const targetDir = dstPane.path || dstPane.homePath || '.'
+      const sourceHostId = srcEp.kind === 'remote' ? srcEp.hostId : undefined
+      const targetHostId = dstEp.kind === 'remote' ? dstEp.hostId : undefined
+      const primaryHostId = targetHostId || sourceHostId
+
+      try {
+        const res = await requestWorker('transfers.enqueue', {
+          hostId: primaryHostId,
+          direction,
+          sourceSide: srcEp.kind,
+          sourceHostId,
+          targetSide: dstEp.kind,
+          targetHostId,
+          priority,
+          items: entries.map((e) => ({
+            sourcePath: e.path,
+            targetDir,
+            isDirectory: e.isDirectory,
+            name: e.name,
+            targetName: renameMap?.[e.path],
+            backupBeforeOverwrite,
+            size: e.size
+          }))
+        })
+        setTransfers(res.snapshot)
+        if (layout === 'split') {
+          setDrawerOpen(true)
+        }
+        const dirLabel =
+          direction === 'remote-to-remote'
+            ? `${getEndpointTitle(srcEp)} → ${getEndpointTitle(dstEp)} ⇄`
+            : direction === 'upload'
+              ? 'Upload ↑'
+              : 'Download ↓'
+        notify(`${entries.length} item(ns) na fila (${dirLabel})`)
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), true)
+      }
+    },
+    [computeDirection, getEndpointTitle, getPane, isEndpointConnected, layout, notify]
+  )
+
+  const enqueueTransfer = useCallback(
+    async (fromPane: PaneId, entries: FileEntry[], priority: TransferPriority = 'normal') => {
+      const srcPane = getPane(fromPane)
+      const dstPane = getPane(otherPaneId(fromPane))
+      const srcEp = srcPane.endpoint
+      const dstEp = dstPane.endpoint
+      const direction = computeDirection(srcEp, dstEp)
+
+      if (!srcEp || !dstEp || !direction) {
+        notify('Selecione ao menos um servidor remoto para transferir arquivos.', true)
+        return
+      }
+      if (!isEndpointConnected(srcEp) || !isEndpointConnected(dstEp)) {
+        notify('Conecte os servidores envolvidos antes de transferir arquivos.', true)
+        return
+      }
+      if (!entries.length) return
+
+      const targetDir = dstPane.path || dstPane.homePath || '.'
+      const sourceHostId = srcEp.kind === 'remote' ? srcEp.hostId : undefined
+      const targetHostId = dstEp.kind === 'remote' ? dstEp.hostId : undefined
+      const primaryHostId = targetHostId || sourceHostId
+
+      try {
+        const check = await requestWorker('transfers.checkConflicts', {
+          hostId: primaryHostId,
+          direction,
+          sourceSide: srcEp.kind,
+          sourceHostId,
+          targetSide: dstEp.kind,
+          targetHostId,
+          items: entries.map((e) => ({
+            sourcePath: e.path,
+            targetDir,
+            isDirectory: e.isDirectory,
+            name: e.name,
+            size: e.size,
+            mtimeMs: e.mtimeMs
+          }))
+        })
+        if (check.conflicts.length > 0) {
+          setModal({
+            kind: 'conflict',
+            fromPane,
+            direction,
+            sourceLabel: getEndpointTitle(srcEp),
+            targetLabel: getEndpointTitle(dstEp),
+            entries,
+            conflicts: check.conflicts,
+            priority
+          })
+          return
+        }
+        await dispatchEnqueue(fromPane, entries, priority)
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), true)
+      }
+    },
+    [computeDirection, dispatchEnqueue, getEndpointTitle, getPane, isEndpointConnected, notify]
+  )
+
   const uploadExternalFinderFiles = useCallback(
-    async (fileList: FileList) => {
-      if (!connection.connected || !connection.hostId) {
+    async (targetPaneId: PaneId, fileList: FileList) => {
+      const targetPane = getPane(targetPaneId)
+      if (!targetPane.endpoint || targetPane.endpoint.kind !== 'remote' || !isEndpointConnected(targetPane.endpoint)) {
         notify('Conecte-se a um host remoto antes de arrastar arquivos do Finder.', true)
         return
       }
+      const targetHostId = targetPane.endpoint.hostId
       const files = Array.from(fileList)
       if (!files.length) return
 
-      // Path A: Electron exposes native File.path -> use full TransferManager queue + conflict modal!
+      // Path A: Electron exposes native File.path -> use full TransferManager queue + conflict check
       const withNativePaths = files as Array<File & { path?: string }>
+      const targetDir = targetPane.path || targetPane.homePath || '.'
       if (withNativePaths.every((f) => typeof f.path === 'string' && f.path.length > 0)) {
-        const fakeEntries: FileEntry[] = withNativePaths.map((f) => ({
-          name: f.name,
-          path: f.path!,
-          isDirectory: false,
-          isSymlink: false,
-          size: f.size,
-          mtimeMs: f.lastModified || Date.now(),
-          mode: 0o100644,
-          permissions: 'rw-r--r--',
-          isHidden: f.name.startsWith('.'),
-          isArchive: false,
-          archiveType: null,
-          isEditableText: false
-        }))
-        await enqueueTransfer('local', fakeEntries, 'normal')
+        try {
+          const res = await requestWorker('transfers.enqueue', {
+            hostId: targetHostId,
+            direction: 'upload',
+            sourceSide: 'local',
+            targetSide: 'remote',
+            targetHostId,
+            priority: 'normal',
+            items: withNativePaths.map((f) => ({
+              sourcePath: f.path!,
+              targetDir,
+              isDirectory: false,
+              name: f.name,
+              backupBeforeOverwrite: true,
+              size: f.size
+            }))
+          })
+          setTransfers(res.snapshot)
+          if (layout === 'split') setDrawerOpen(true)
+          notify(`${withNativePaths.length} arquivo(s) do Finder na fila`)
+        } catch (err) {
+          notify(err instanceof Error ? err.message : String(err), true)
+        }
         return
       }
 
-      // Path B: Isolated sandbox frame (no File.path) -> stream in 256 KB base64 chunks!
-      const targetDir = remotePath || remoteHome || '.'
+      // Path B: Isolated sandbox frame -> stream in 256 KB base64 chunks
       const CHUNK = 256 * 1024
       let uploaded = 0
       try {
         for (const file of files) {
           notify(`Enviando do Finder: ${file.name}...`)
           const init = await requestWorker('fs.uploadChunkInit', {
-            hostId: connection.hostId,
+            hostId: targetHostId,
             targetDir,
             name: file.name,
             backupBeforeOverwrite: true
@@ -551,123 +988,12 @@ function App() {
           }
         }
         notify(`${uploaded} arquivo(s) enviado(s) do Finder para ${targetDir}`)
-        await loadRemote(targetDir)
+        await refreshPane(targetPaneId)
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), true)
       }
     },
-    [connection.connected, connection.hostId, loadRemote, notify, remoteHome, remotePath]
-  )
-
-  const refreshSide = useCallback(
-    async (side: Side) => {
-      if (side === 'local') await loadLocal(localPath || localHome)
-      else if (connection.connected) await loadRemote(remotePath || remoteHome)
-    },
-    [connection.connected, loadLocal, loadRemote, localHome, localPath, remoteHome, remotePath]
-  )
-
-  const openEditorForEntry = useCallback(
-    async (side: Side, entry: FileEntry, forceText = false) => {
-      try {
-        const payload = await requestWorker('editor.read', {
-          side,
-          path: entry.path,
-          hostId: side === 'remote' ? connection.hostId || undefined : undefined,
-          forceText
-        })
-        setEditorFile(payload)
-      } catch (err) {
-        notify(err instanceof Error ? err.message : String(err), true)
-      }
-    },
-    [connection.hostId, notify]
-  )
-
-  const dispatchEnqueue = useCallback(
-    async (
-      fromSide: Side,
-      entries: FileEntry[],
-      priority: TransferPriority = 'normal',
-      renameMap?: Record<string, string>,
-      backupBeforeOverwrite = false
-    ) => {
-      if (!connection.connected || !connection.hostId) {
-        notify('Conecte-se a um host remoto antes de transferir arquivos.', true)
-        return
-      }
-      if (!entries.length) return
-      const direction = fromSide === 'local' ? 'upload' : 'download'
-      const targetDir = direction === 'upload' ? remotePath || remoteHome : localPath || localHome
-      try {
-        const res = await requestWorker('transfers.enqueue', {
-          hostId: connection.hostId,
-          direction,
-          priority,
-          items: entries.map((e) => ({
-            sourcePath: e.path,
-            targetDir,
-            isDirectory: e.isDirectory,
-            name: e.name,
-            targetName: renameMap?.[e.path],
-            backupBeforeOverwrite,
-            size: e.size
-          }))
-        })
-        setTransfers(res.snapshot)
-        // Auto-open transfer drawer in Split mode so activity is immediately visible
-        if (layout === 'split') {
-          setDrawerOpen(true)
-        }
-        notify(
-          `${entries.length} item(ns) na fila (${direction === 'upload' ? 'Upload ↑' : 'Download ↓'})`
-        )
-      } catch (err) {
-        notify(err instanceof Error ? err.message : String(err), true)
-      }
-    },
-    [connection.connected, connection.hostId, layout, localHome, localPath, notify, remoteHome, remotePath]
-  )
-
-  const enqueueTransfer = useCallback(
-    async (fromSide: Side, entries: FileEntry[], priority: TransferPriority = 'normal') => {
-      if (!connection.connected || !connection.hostId) {
-        notify('Conecte-se a um host remoto antes de transferir arquivos.', true)
-        return
-      }
-      if (!entries.length) return
-      const direction = fromSide === 'local' ? 'upload' : 'download'
-      const targetDir = direction === 'upload' ? remotePath || remoteHome : localPath || localHome
-      try {
-        const check = await requestWorker('transfers.checkConflicts', {
-          hostId: connection.hostId,
-          direction,
-          items: entries.map((e) => ({
-            sourcePath: e.path,
-            targetDir,
-            isDirectory: e.isDirectory,
-            name: e.name,
-            size: e.size,
-            mtimeMs: e.mtimeMs
-          }))
-        })
-        if (check.conflicts.length > 0) {
-          setModal({
-            kind: 'conflict',
-            fromSide,
-            direction,
-            entries,
-            conflicts: check.conflicts,
-            priority
-          })
-          return
-        }
-        await dispatchEnqueue(fromSide, entries, priority)
-      } catch (err) {
-        notify(err instanceof Error ? err.message : String(err), true)
-      }
-    },
-    [connection.connected, connection.hostId, dispatchEnqueue, localHome, localPath, notify, remoteHome, remotePath]
+    [getPane, isEndpointConnected, layout, notify, refreshPane]
   )
 
   const handleTransferAction = useCallback(
@@ -696,13 +1022,23 @@ function App() {
 
   const handleSyncWorkspace = async () => {
     if (workspaceHint.localPath) {
-      await loadLocal(workspaceHint.localPath)
+      const localPaneId: PaneId =
+        leftPaneRef.current.endpoint?.kind === 'local'
+          ? 'left'
+          : rightPaneRef.current.endpoint?.kind === 'local'
+            ? 'right'
+            : 'left'
+      patchPane(localPaneId, { endpoint: { kind: 'local' }, homePath: localHomeRef.current })
+      await loadPaneDirectory(localPaneId, { kind: 'local' }, workspaceHint.localPath)
       notify(`Local sincronizado com ${workspaceHint.workspaceName || 'workspace'}`)
     }
     if (workspaceHint.hostId) {
-      const host = hosts.find((h) => h.id === workspaceHint.hostId)
+      const host = hostsRef.current.find((h) => h.id === workspaceHint.hostId)
       if (host) {
-        await connectHost(host.id, workspaceHint.remotePath || undefined)
+        await connectHostById(host.id, {
+          attachToPane: 'right',
+          overrideRemotePath: workspaceHint.remotePath || undefined
+        })
         return
       }
     }
@@ -711,62 +1047,92 @@ function App() {
     }
   }
 
-  const handleSaveHost = async (input: SaveHostInput) => {
+  const handleSaveHost = async (input: SaveHostInput, attachToPane?: PaneId) => {
     const res = await requestWorker('hosts.save', input)
     setHosts(res.hosts)
+    hostsRef.current = res.hosts
     if (res.host) {
-      setSelectedHostId(res.host.id)
-      // Connect immediately after saving
-      const conn = await requestWorker('connection.connect', { hostId: res.host.id })
-      setConnection(conn.connection)
-      setRemoteHome(conn.connection.remoteHome || conn.remotePath)
-      setRemotePath(conn.remotePath)
-      setRemoteEntries(conn.entries)
-      notify(`Host "${res.host.name}" salvo e conectado`)
+      await connectHostById(res.host.id, {
+        forceReconnect: true,
+        attachToPane: attachToPane || 'right'
+      })
     }
   }
 
   const handleDeleteHost = async (hostId: string) => {
     const res = await requestWorker('hosts.delete', { hostId })
     setHosts(res.hosts)
+    hostsRef.current = res.hosts
+    setHostStates((prev) => {
+      const copy = { ...prev }
+      delete copy[hostId]
+      return copy
+    })
+    for (const paneId of ['left', 'right'] as PaneId[]) {
+      const ep = getPane(paneId).endpoint
+      if (ep?.kind === 'remote' && ep.hostId === hostId) {
+        patchPane(paneId, { endpoint: paneId === 'left' ? { kind: 'local' } : null, entries: [] })
+      }
+    }
     notify('Conexão removida')
   }
 
-  const handleToggleBookmark = async (side: Side) => {
-    const currentPath = side === 'local' ? localPath : remotePath
-    if (!currentPath) return
+  const handleToggleBookmark = async (paneId: PaneId) => {
+    const pane = getPane(paneId)
+    if (!pane.endpoint || !pane.path) return
     const res = await requestWorker('bookmarks.toggle', {
-      side,
-      path: currentPath,
-      label: posixBasename(currentPath) || currentPath,
-      hostId: side === 'remote' ? connection.hostId || undefined : undefined
+      side: pane.endpoint.kind,
+      path: pane.path,
+      label: posixBasename(pane.path) || pane.path,
+      hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
     })
     setBookmarks(res.bookmarks)
   }
 
-  // Group hosts cleanly for the dropdown
-  const hostGroups = useMemo(() => {
-    return {
-      orcaSsh: hosts.filter((h) => h.kind === 'orca-ssh'),
-      orcaEnv: hosts.filter((h) => h.kind === 'orca-env'),
-      sshConfig: hosts.filter((h) => h.kind === 'ssh-config'),
-      manual: hosts.filter((h) => h.kind === 'manual')
-    }
-  }, [hosts])
+  const refreshHostsList = useCallback(() => {
+    void requestWorker('hosts.list')
+      .then((r) => {
+        setHosts(r.hosts)
+        hostsRef.current = r.hosts
+        setHostStates(r.hostStates)
+        hostStatesRef.current = r.hostStates
+        notify(`${r.hosts.length} host(s) atualizado(s)`)
+      })
+      .catch((err) => notify(err instanceof Error ? err.message : String(err), true))
+  }, [notify])
 
-  const selectedProfile = hosts.find((h) => h.id === selectedHostId)
+  // Real overall SFTP connection status across deduplicated hosts
+  const displayHosts = useMemo(() => {
+    const inUse = new Set<string>()
+    if (leftPane.endpoint?.kind === 'remote') inUse.add(leftPane.endpoint.hostId)
+    if (rightPane.endpoint?.kind === 'remote') inUse.add(rightPane.endpoint.hostId)
+    return deduplicateHostsForDisplay(hosts, hostStates, inUse)
+  }, [hosts, hostStates, leftPane.endpoint, rightPane.endpoint])
+
+  const connectedHostCount = useMemo(
+    () => displayHosts.filter((h) => hostStates[h.id]?.state === 'connected').length,
+    [displayHosts, hostStates]
+  )
+  const anyConnecting = useMemo(
+    () => displayHosts.some((h) => hostStates[h.id]?.state === 'connecting'),
+    [displayHosts, hostStates]
+  )
+  const overallStatus: HostConnectionState = anyConnecting
+    ? 'connecting'
+    : connectedHostCount > 0
+      ? 'connected'
+      : 'disconnected'
+
   const pendingTransfers = transfers.activeCount + transfers.queuedCount
-  const showRedDot = pendingTransfers > 0 || transfers.errorCount > 0
 
-  // Responsive layout breakpoints:
-  // - < 520px: automatically uses Tabs mode (never cramped stacked split!)
-  // - < 310px: segmented tabs turn into a clean dropdown menu (never clipped text!)
+  // Responsive layout breakpoints
   const canSplit = viewportWidth >= 520
   const effectiveLayout: LayoutMode = layout === 'split' && canSplit ? 'split' : 'tabs'
   const useCompactTabMenu = effectiveLayout === 'tabs' && viewportWidth < 310
   const useShortTabLabel = effectiveLayout === 'tabs' && viewportWidth < 370
-  const paneNarrow = effectiveLayout === 'split' ? viewportWidth * (splitRatio / 100) < 350 : viewportWidth < 350
-  const remotePaneNarrow =
+  const leftPaneNarrow =
+    effectiveLayout === 'split' ? viewportWidth * (splitRatio / 100) < 350 : viewportWidth < 350
+  const rightPaneNarrow =
     effectiveLayout === 'split' ? viewportWidth * ((100 - splitRatio) / 100) < 350 : viewportWidth < 350
 
   const runningSummary = useMemo(() => {
@@ -775,11 +1141,13 @@ function App() {
     const total = running.reduce((s, i) => s + i.totalBytes, 0)
     const done = running.reduce((s, i) => s + i.bytesTransferred, 0)
     const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0
+    const sym =
+      running[0].direction === 'remote-to-remote' ? '⇄' : running[0].direction === 'upload' ? '↑' : '↓'
     return {
       pct,
       label:
         running.length === 1
-          ? `${running[0].direction === 'upload' ? '↑' : '↓'} ${running[0].name} (${pct}%)`
+          ? `${sym} ${running[0].name} (${pct}%)`
           : `${running.length} transferindo (${pct}%)`
     }
   }, [transfers.items])
@@ -802,68 +1170,97 @@ function App() {
     return null
   }
 
+  const leftTitle = getEndpointTitle(leftPane.endpoint)
+  const rightTitle = getEndpointTitle(rightPane.endpoint)
+  const leftConnected = isEndpointConnected(leftPane.endpoint, hostStates)
+  const rightConnected = isEndpointConnected(rightPane.endpoint, hostStates)
+  const leftToRightDir = computeDirection(leftPane.endpoint, rightPane.endpoint)
+  const rightToLeftDir = computeDirection(rightPane.endpoint, leftPane.endpoint)
+  const canTransferLeftToRight = Boolean(leftToRightDir && leftConnected && rightConnected)
+  const canTransferRightToLeft = Boolean(rightToLeftDir && leftConnected && rightConnected)
+
   const contextCallbacks = {
     onClose: () => setContextMenu(null),
-    onOpenFolder: (entry: FileEntry) => {
-      if (!contextMenu) return
-      void navigateSide(contextMenu.side, entry.path, { kind: 'enter', name: entry.name })
+    onOpenFolder: (paneId: PaneId, entry: FileEntry) => {
+      void navigatePane(paneId, entry.path, { kind: 'enter', name: entry.name })
     },
-    onTransfer: (side: Side, entries: FileEntry[], priority: 'high' | 'normal' = 'normal') => {
-      void enqueueTransfer(side, entries, priority)
+    onTransfer: (paneId: PaneId, entries: FileEntry[], priority: 'high' | 'normal' = 'normal') => {
+      void enqueueTransfer(paneId, entries, priority)
     },
-    onEdit: (side: Side, entry: FileEntry, forceText = false) => {
-      void openEditorForEntry(side, entry, forceText)
+    onEdit: (paneId: PaneId, entry: FileEntry, forceText = false) => {
+      void openEditorForEntry(paneId, entry, forceText)
     },
-    onPreviewImage: (side: Side, entry: FileEntry) => {
-      void openImagePreview(side, entry)
+    onPreviewImage: (paneId: PaneId, entry: FileEntry) => {
+      void openImagePreview(paneId, entry)
     },
-    onTailLog: (side: Side, entry: FileEntry) => {
-      void openLogTail(side, entry)
+    onTailLog: (paneId: PaneId, entry: FileEntry) => {
+      void openLogTail(paneId, entry)
     },
-    onCompress: (side: Side, entries: FileEntry[], format: ArchiveFormat) => {
-      setModal({ kind: 'compress', side, entries, defaultFormat: format })
+    onCompress: (paneId: PaneId, entries: FileEntry[], format: ArchiveFormat) => {
+      const ep = getPane(paneId).endpoint
+      if (!ep) return
+      setModal({ kind: 'compress', paneId, side: ep.kind, entries, defaultFormat: format })
     },
-    onExtract: (side: Side, entry: FileEntry, createSubfolder: boolean) => {
-      const dest = side === 'local' ? localPath : remotePath
+    onExtract: (paneId: PaneId, entry: FileEntry, createSubfolder: boolean) => {
+      const pane = getPane(paneId)
+      if (!pane.endpoint) return
       notify(`Descompactando ${entry.name}...`)
-      void orca.plugin
-        .request('fs.extract', {
-          side,
-          archivePath: entry.path,
-          destinationDir: dest,
-          createSubfolder,
-          hostId: side === 'remote' ? connection.hostId || undefined : undefined
-        })
+      void requestWorker('fs.extract', {
+        side: pane.endpoint.kind,
+        archivePath: entry.path,
+        destinationDir: pane.path,
+        createSubfolder,
+        hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
+      })
         .then(async (res) => {
           notify(`Extraído em ${res.extractedTo}`)
-          await refreshSide(side)
+          await refreshPane(paneId)
         })
         .catch((err) => notify(err instanceof Error ? err.message : String(err), true))
     },
-    onNewFolder: (side: Side) => setModal({ kind: 'mkdir', side }),
-    onNewFile: (side: Side) => setModal({ kind: 'newFile', side }),
-    onRename: (side: Side, entry: FileEntry) => setModal({ kind: 'rename', side, entry }),
-    onChmod: (side: Side, entry: FileEntry) => setModal({ kind: 'chmod', side, entry }),
+    onNewFolder: (paneId: PaneId) => {
+      const ep = getPane(paneId).endpoint
+      if (ep) setModal({ kind: 'mkdir', paneId, side: ep.kind })
+    },
+    onNewFile: (paneId: PaneId) => {
+      const ep = getPane(paneId).endpoint
+      if (ep) setModal({ kind: 'newFile', paneId, side: ep.kind })
+    },
+    onRename: (paneId: PaneId, entry: FileEntry) => {
+      const ep = getPane(paneId).endpoint
+      if (ep) setModal({ kind: 'rename', paneId, side: ep.kind, entry })
+    },
+    onChmod: (paneId: PaneId, entry: FileEntry) => {
+      const ep = getPane(paneId).endpoint
+      if (ep) setModal({ kind: 'chmod', paneId, side: ep.kind, entry })
+    },
     onCopyPath: (entry: FileEntry) => {
       void navigator.clipboard?.writeText(entry.path).then(() => notify('Caminho copiado'))
     },
-    onDelete: (side: Side, entries: FileEntry[]) => setModal({ kind: 'delete', side, entries }),
-    onRefresh: (side: Side) => void refreshSide(side),
-    canTransfer: connection.connected
+    onDelete: (paneId: PaneId, entries: FileEntry[]) => {
+      const ep = getPane(paneId).endpoint
+      if (ep) setModal({ kind: 'delete', paneId, side: ep.kind, entries })
+    },
+    onRefresh: (paneId: PaneId) => void refreshPane(paneId),
+    canTransfer: contextMenu
+      ? contextMenu.paneId === 'left'
+        ? canTransferLeftToRight
+        : canTransferRightToLeft
+      : false
   }
 
   const handleOpenSearchResult = useCallback(
-    async (side: Side, res: SearchResultEntry) => {
+    async (paneId: PaneId, res: SearchResultEntry) => {
       if (res.isDirectory) {
-        await navigateSide(side, res.path)
+        await navigatePane(paneId, res.path)
         return
       }
-      await navigateSide(side, res.parentDir)
+      await navigatePane(paneId, res.parentDir)
       if (res.isImage) {
-        await openImagePreview(side, { path: res.path, name: res.name })
+        await openImagePreview(paneId, { path: res.path, name: res.name })
       } else if (res.isEditableText) {
         await openEditorForEntry(
-          side,
+          paneId,
           {
             name: res.name,
             path: res.path,
@@ -882,132 +1279,175 @@ function App() {
         )
       }
     },
-    [navigateSide, openEditorForEntry, openImagePreview]
+    [navigatePane, openEditorForEntry, openImagePreview]
   )
 
-  const localPane = (
-    <FilePane
-      side="local"
-      title="Local"
-      path={localPath}
-      homePath={localHome}
-      entries={localEntries}
-      loading={localLoading}
-      error={localError}
-      connected={true}
-      showHidden={showHiddenLocal}
-      narrow={paneNarrow}
-      bookmarks={bookmarks}
-      selectedPaths={localSelected}
-      onToggleHidden={() => setShowHiddenLocal((v) => !v)}
-      onNavigate={(p, rel) => void navigateSide('local', p, rel)}
-      onRefresh={() => void loadLocal(localPath || localHome)}
-      onToggleBookmark={() => void handleToggleBookmark('local')}
-      onSelectChange={setLocalSelected}
-      onOpenEntry={(entry) => {
-        if (entry.isDirectory) void navigateSide('local', entry.path, { kind: 'enter', name: entry.name })
-        else if (entry.isImage) void openImagePreview('local', entry)
-        else if (entry.isEditableText) void openEditorForEntry('local', entry, false)
-        else if (connection.connected) void enqueueTransfer('local', [entry])
-      }}
-      onContextMenu={(e, entries) => setContextMenu({ x: e.clientX, y: e.clientY, side: 'local', entries })}
-      onTransferSelected={(entries) => void enqueueTransfer('local', entries)}
-      onDropFromOtherSide={(entries) => void enqueueTransfer('remote', entries)}
-      onRecursiveSearch={(q) =>
-        requestWorker('fs.search', { side: 'local', rootPath: localPath || localHome, query: q })
-      }
-      onOpenSearchResult={(res) => void handleOpenSearchResult('local', res)}
-      canTransfer={connection.connected}
-    />
-  )
+  const buildPaneElement = (paneId: PaneId) => {
+    const pane = paneId === 'left' ? leftPane : rightPane
+    const otherId = otherPaneId(paneId)
+    const ep = pane.endpoint
+    const side = ep?.kind === 'remote' ? 'remote' : 'local'
+    const title = paneId === 'left' ? leftTitle : rightTitle
+    const otherTitle = paneId === 'left' ? rightTitle : leftTitle
+    const connected = paneId === 'left' ? leftConnected : rightConnected
+    const transferDir = paneId === 'left' ? leftToRightDir : rightToLeftDir
+    const canTransfer = paneId === 'left' ? canTransferLeftToRight : canTransferRightToLeft
+    const narrow = paneId === 'left' ? leftPaneNarrow : rightPaneNarrow
+    const hostId = ep?.kind === 'remote' ? ep.hostId : undefined
+    const profile = hostId ? hosts.find((h) => h.id === hostId) : undefined
 
-  const remotePane = (
-    <FilePane
-      side="remote"
-      title={connection.hostName || selectedProfile?.name || 'Remoto'}
-      path={remotePath}
-      homePath={remoteHome}
-      entries={remoteEntries}
-      loading={remoteLoading}
-      error={remoteError}
-      connected={connection.connected}
-      showHidden={showHiddenRemote}
-      narrow={remotePaneNarrow}
-      bookmarks={bookmarks.filter((b) => !b.hostId || b.hostId === connection.hostId)}
-      selectedPaths={remoteSelected}
-      onToggleHidden={() => setShowHiddenRemote((v) => !v)}
-      onNavigate={(p, rel) => void navigateSide('remote', p, rel)}
-      onRefresh={() => void loadRemote(remotePath || remoteHome)}
-      onToggleBookmark={() => void handleToggleBookmark('remote')}
-      onSelectChange={setRemoteSelected}
-      onOpenEntry={(entry) => {
-        if (entry.isDirectory) void navigateSide('remote', entry.path, { kind: 'enter', name: entry.name })
-        else if (entry.isImage) void openImagePreview('remote', entry)
-        else if (entry.isEditableText) void openEditorForEntry('remote', entry, false)
-        else void enqueueTransfer('remote', [entry])
-      }}
-      onContextMenu={(e, entries) => setContextMenu({ x: e.clientX, y: e.clientY, side: 'remote', entries })}
-      onTransferSelected={(entries) => void enqueueTransfer('remote', entries)}
-      onDropFromOtherSide={(entries) => void enqueueTransfer('local', entries)}
-      onDropExternalFiles={(files) => void uploadExternalFinderFiles(files)}
-      onRecursiveSearch={(q) =>
-        requestWorker('fs.search', {
-          side: 'remote',
-          rootPath: remotePath || remoteHome || '.',
-          query: q,
-          hostId: connection.hostId || undefined
-        })
-      }
-      onOpenSearchResult={(res) => void handleOpenSearchResult('remote', res)}
-      canTransfer={connection.connected}
-      disconnectedAction={
-        selectedProfile
-          ? {
-              label: selectedProfile.needsSshBinding
-                ? `Vincular SSH em ${selectedProfile.name}`
-                : `Conectar a ${selectedProfile.name}`,
-              hint: selectedProfile.needsSshBinding
-                ? `Servidor Orca Remoto encontrado via VPN (${selectedProfile.hostname || 'endpoint'}). Configure o vínculo SSH uma vez para navegar via SFTP.`
-                : `Pronto para abrir ponte SFTP em ${selectedProfile.name} (${selectedProfile.sourceLabel}).`,
-              onClick: () => void connectHost(selectedProfile.id)
-            }
-          : {
-              label: 'Nova conexão SSH',
-              hint: 'Adicione uma conexão SSH manual ou atualize a lista de hosts da Orca.',
-              onClick: () => setModal({ kind: 'host' })
-            }
-      }
-    />
-  )
+    const transferLabel =
+      transferDir === 'remote-to-remote'
+        ? `Enviar para ${otherTitle}`
+        : transferDir === 'download'
+          ? 'Baixar para Local'
+          : `Enviar para ${otherTitle}`
+    const transferIcon: 'upload' | 'download' | 'arrows-up-down' =
+      transferDir === 'remote-to-remote'
+        ? 'arrows-up-down'
+        : transferDir === 'download'
+          ? 'download'
+          : 'upload'
 
+    const paneBookmarks =
+      side === 'local'
+        ? bookmarks.filter((b) => b.side === 'local')
+        : bookmarks.filter((b) => b.side === 'remote' && (!b.hostId || b.hostId === hostId))
+
+    return (
+      <FilePane
+        paneId={paneId}
+        side={side}
+        endpoint={ep}
+        title={title}
+        hostState={hostId ? hostStates[hostId] : undefined}
+        hosts={hosts}
+        hostStates={hostStates}
+        otherPaneTitle={otherTitle}
+        transferDirection={transferDir}
+        path={pane.path}
+        homePath={pane.homePath}
+        entries={pane.entries}
+        loading={pane.loading}
+        error={pane.error}
+        connected={connected}
+        showHidden={pane.showHidden}
+        narrow={narrow}
+        bookmarks={paneBookmarks}
+        selectedPaths={pane.selected}
+        onSelectEndpoint={(nextEp) => void selectPaneEndpoint(paneId, nextEp)}
+        onOpenConnectionsManager={() => setConnectionsOpen(true)}
+        onToggleHidden={() => patchPane(paneId, (prev) => ({ ...prev, showHidden: !prev.showHidden }))}
+        onNavigate={(p, rel) => void navigatePane(paneId, p, rel)}
+        onRefresh={() => void refreshPane(paneId)}
+        onToggleBookmark={() => void handleToggleBookmark(paneId)}
+        onSelectChange={(next) => patchPane(paneId, { selected: next })}
+        onOpenEntry={(entry) => {
+          if (entry.isDirectory) void navigatePane(paneId, entry.path, { kind: 'enter', name: entry.name })
+          else if (entry.isImage) void openImagePreview(paneId, entry)
+          else if (entry.isEditableText) void openEditorForEntry(paneId, entry, false)
+          else if (canTransfer) void enqueueTransfer(paneId, [entry])
+        }}
+        onContextMenu={(e, entries) =>
+          setContextMenu({
+            x: e.clientX,
+            y: e.clientY,
+            paneId,
+            transferLabel,
+            transferIcon,
+            entries
+          })
+        }
+        onTransferSelected={(entries) => void enqueueTransfer(paneId, entries)}
+        onDropFromOtherPane={(entries) => void enqueueTransfer(otherId, entries)}
+        onDropExternalFiles={
+          side === 'remote' ? (files) => void uploadExternalFinderFiles(paneId, files) : undefined
+        }
+        onRecursiveSearch={(q) =>
+          requestWorker('fs.search', {
+            side,
+            rootPath: pane.path || pane.homePath || '.',
+            query: q,
+            hostId
+          })
+        }
+        onOpenSearchResult={(res) => void handleOpenSearchResult(paneId, res)}
+        canTransfer={canTransfer}
+        disconnectedAction={
+          profile
+            ? {
+                label: profile.needsSshBinding
+                  ? `Vincular SSH em ${profile.name}`
+                  : `Conectar a ${profile.name}`,
+                hint: profile.needsSshBinding
+                  ? `Servidor Orca Remoto encontrado via VPN (${profile.hostname || 'endpoint'}). Configure o vínculo SSH uma vez para navegar via SFTP.`
+                  : `Pronto para abrir ponte SFTP em ${profile.name} (${profile.sourceLabel}).`,
+                onClick: () => void connectHostById(profile.id, { attachToPane: paneId }),
+                secondaryLabel: 'Gerenciar hosts',
+                onSecondaryClick: () => setConnectionsOpen(true)
+              }
+            : {
+                label: 'Gerenciar conexões',
+                hint: 'Escolha um servidor no título acima ou configure uma nova conexão SSH/SFTP.',
+                onClick: () => setConnectionsOpen(true),
+                secondaryLabel: 'Nova conexão',
+                onSecondaryClick: () => setModal({ kind: 'host', attachToPane: paneId })
+              }
+        }
+      />
+    )
+  }
+
+  const leftPaneEl = buildPaneElement('left')
+  const rightPaneEl = buildPaneElement('right')
+
+  const leftTabLabel = leftPane.endpoint?.kind === 'remote' ? leftTitle : 'Local'
+  const rightTabLabel = rightPane.endpoint?.kind === 'remote' ? rightTitle : rightPane.endpoint?.kind === 'local' ? 'Local' : 'Remoto'
   const activeTabLabel =
-    activeTab === 'local' ? 'Local' : activeTab === 'remote' ? 'Remoto' : 'Transferências'
+    activeTab === 'local' ? leftTabLabel : activeTab === 'remote' ? rightTabLabel : 'Transferências'
+
+  const leftRemoteState: HostConnectionState | null =
+    leftPane.endpoint?.kind === 'remote'
+      ? hostStates[leftPane.endpoint.hostId]?.state || 'disconnected'
+      : null
+  const rightRemoteState: HostConnectionState | null =
+    rightPane.endpoint?.kind === 'remote'
+      ? hostStates[rightPane.endpoint.hostId]?.state || 'disconnected'
+      : null
 
   return (
     <div class="app">
-      {/* Top Header */}
+      {/* Permanently Fixed Single-Row Top Header */}
       <div class="header">
         <div class="header-top">
           <div class="header-title-group">
             <span
-              class={`status-dot ${
-                connection.connecting
-                  ? 'connecting'
-                  : connection.connected
-                    ? 'connected'
-                    : connection.error
-                      ? 'error'
-                      : ''
-              }`}
+              class={`status-dot ${dotClassForState(overallStatus)}`}
               title={
-                connection.connected
-                  ? `Conectado via ${connection.transportMode}`
-                  : connection.connecting
-                    ? 'Conectando...'
-                    : 'Desconectado'
+                overallStatus === 'connected'
+                  ? `${connectedHostCount} sessão(ões) SFTP conectada(s)`
+                  : overallStatus === 'connecting'
+                    ? 'Conectando / reconectando sessão SFTP...'
+                    : 'Nenhuma sessão SFTP conectada'
               }
             />
             <span class="header-title">{viewportWidth < 290 ? 'SFTP' : 'SFTP Bridge'}</span>
+            {viewportWidth >= 430 && (
+              <button
+                class={`header-conn-pill ${connectionsOpen ? 'active' : ''}`}
+                title="Abrir / fechar Gerenciador de Conexões e Hosts SFTP"
+                onClick={() => {
+                  setHubOpen(false)
+                  setConnectionsOpen((v) => !v)
+                }}
+              >
+                {overallStatus === 'connecting'
+                  ? 'Conectando...'
+                  : connectedHostCount > 0
+                    ? `${connectedHostCount} online`
+                    : 'Offline'}
+              </button>
+            )}
           </div>
 
           <div class="header-actions">
@@ -1017,8 +1457,8 @@ function App() {
                   class={`icon-btn ${syncBrowsing ? 'icon-btn-accent' : ''}`}
                   title={
                     syncBrowsing
-                      ? 'Navegação Sincronizada ATIVA (Local ⇄ Remoto)'
-                      : 'Ativar Navegação Sincronizada (Local ⇄ Remoto)'
+                      ? `Navegação Sincronizada ATIVA (${leftTitle} ⇄ ${rightTitle})`
+                      : `Ativar Navegação Sincronizada (${leftTitle} ⇄ ${rightTitle})`
                   }
                   onClick={toggleSyncBrowsing}
                 >
@@ -1027,7 +1467,10 @@ function App() {
                 <button
                   class={`icon-btn ${drawerOpen ? 'active' : ''}`}
                   title="Abrir / fechar fila de transferências"
-                  onClick={() => setDrawerOpen((v) => !v)}
+                  onClick={() => {
+                    setConnectionsOpen(false)
+                    setDrawerOpen((v) => !v)
+                  }}
                 >
                   <Icon name="arrows-up-down" size={14} />
                   {pendingTransfers > 0 && <span class="icon-corner-badge">{pendingTransfers}</span>}
@@ -1043,34 +1486,26 @@ function App() {
             <button
               class="icon-btn"
               title="Ir para o diretório do Workspace ativo na Orca"
-              onClick={() => void handleSyncWorkspace()}
+              onClick={() => {
+                setConnectionsOpen(false)
+                void handleSyncWorkspace()
+              }}
             >
               <Icon name="crosshair" size={14} />
             </button>
             <button
-              class="icon-btn"
-              title="Atualizar lista de hosts Orca e ~/.ssh/config"
-              onClick={() =>
-                void requestWorker('hosts.list')
-                  .then((r) => {
-                    setHosts(r.hosts)
-                    notify(`${r.hosts.length} host(s) atualizado(s)`)
-                  })
-                  .catch((err) => notify(err instanceof Error ? err.message : String(err), true))
-              }
+              class={`icon-btn ${connectionsOpen ? 'icon-btn-accent' : ''}`}
+              title="Conexões e Hosts SFTP (abrir / fechar)"
+              onClick={() => {
+                setHubOpen(false)
+                setConnectionsOpen((v) => !v)
+              }}
             >
-              <Icon name="refresh" size={14} />
-            </button>
-            <button
-              class="icon-btn"
-              title="Nova conexão SSH"
-              onClick={() => setModal({ kind: 'host' })}
-            >
-              <Icon name="plus" size={14} />
+              <Icon name="server" size={14} />
             </button>
             <button
               class={`icon-btn ${hubOpen ? 'icon-btn-accent' : ''}`}
-              title="Central SFTP (transferências, ações rápidas e servidores)"
+              title="Central SFTP (abrir / fechar)"
               onClick={() => setHubOpen((v) => !v)}
             >
               <Icon name="zap" size={14} />
@@ -1082,107 +1517,22 @@ function App() {
                 !canSplit
                   ? 'Amplie a barra lateral (>= 520px) para ativar o modo Dividido'
                   : effectiveLayout === 'tabs'
-                    ? 'Alternar para modo Dividido (Electerm)'
-                    : 'Alternar para modo Abas (Compacto)'
+                    ? 'Alternar para modo Dividido (lado a lado)'
+                    : 'Alternar para modo Abas (compacto)'
               }
-              onClick={toggleLayout}
+              onClick={() => {
+                setConnectionsOpen(false)
+                toggleLayout()
+              }}
             >
               <Icon name={effectiveLayout === 'tabs' ? 'split' : 'tabs'} size={14} />
             </button>
           </div>
         </div>
-
-        <div class="host-bar">
-          <div class="host-select-wrap">
-            <select
-              class="host-select"
-              value={selectedHostId}
-              onChange={(e) => {
-                const id = (e.target as HTMLSelectElement).value
-                setSelectedHostId(id)
-                if (id) void connectHost(id)
-              }}
-            >
-              <option value="">Selecionar host remoto...</option>
-              {hostGroups.orcaSsh.length > 0 && (
-                <optgroup label="Orca · Hosts SSH">
-                  {hostGroups.orcaSsh.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.connected ? '● ' : '○ '}
-                      {h.name} ({h.sourceLabel})
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {hostGroups.orcaEnv.length > 0 && (
-                <optgroup label="Orca · Servidores Remotos">
-                  {hostGroups.orcaEnv.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.needsSshBinding ? '⚡ ' : '● '}
-                      {h.name} ({h.sourceLabel})
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {hostGroups.sshConfig.length > 0 && (
-                <optgroup label="~/.ssh/config">
-                  {hostGroups.sshConfig.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.name} ({h.hostname})
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {hostGroups.manual.length > 0 && (
-                <optgroup label="Conexões Salvas">
-                  {hostGroups.manual.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.name} ({h.username}@{h.hostname})
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
-            <span class="host-select-chevron">
-              <Icon name="chevron-down" size={13} />
-            </span>
-          </div>
-
-          {selectedProfile && (
-            <button
-              class="icon-btn"
-              title="Configurar / vincular SSH deste host"
-              onClick={() => setModal({ kind: 'host', initial: selectedProfile })}
-            >
-              <Icon name="settings" size={13} />
-            </button>
-          )}
-
-          {connection.connected ? (
-            <button
-              class="btn xs"
-              title="Desconectar sessão SFTP"
-              onClick={() =>
-                void requestWorker('connection.disconnect').then((r) => {
-                  setConnection(r.connection)
-                  setRemoteEntries([])
-                  notify('Desconectado')
-                })
-              }
-            >
-              Sair
-            </button>
-          ) : (
-            <button
-              class="btn primary xs"
-              disabled={!selectedHostId || connection.connecting}
-              onClick={() => selectedHostId && void connectHost(selectedHostId)}
-            >
-              {connection.connecting ? '...' : 'Conectar'}
-            </button>
-          )}
-        </div>
       </div>
+
+      {/* Main Content Area below fixed header (overlays live inside here so header never disappears!) */}
+      <div class="app-content">
 
       {/* Mode 1: Tabbed Layout (auto-used when < 520px or user selected Tabs) */}
       {effectiveLayout === 'tabs' && (
@@ -1195,11 +1545,19 @@ function App() {
                 onClick={() => setCompactTabMenuOpen((v) => !v)}
               >
                 <span class="compact-tab-trigger-left">
-                  <Icon
-                    name={activeTab === 'local' ? 'folder' : activeTab === 'remote' ? 'plug' : 'sync'}
-                    size={13}
-                  />
-                  <span>{activeTabLabel}</span>
+                  {activeTab === 'local' && leftRemoteState ? (
+                    <span class={`status-dot sm ${dotClassForState(leftRemoteState)}`} />
+                  ) : activeTab === 'remote' && rightRemoteState ? (
+                    <span class={`status-dot sm ${dotClassForState(rightRemoteState)}`} />
+                  ) : (
+                    <Icon
+                      name={activeTab === 'local' ? 'folder' : activeTab === 'remote' ? 'server' : 'arrows-up-down'}
+                      size={13}
+                    />
+                  )}
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {activeTabLabel}
+                  </span>
                   {activeTab !== 'transfers' && renderTransferBadge()}
                 </span>
                 <Icon name={compactTabMenuOpen ? 'chevron-up' : 'chevron-down'} size={14} />
@@ -1215,7 +1573,12 @@ function App() {
                     }}
                   >
                     <span class="compact-tab-trigger-left">
-                      <Icon name="folder" size={13} /> Local
+                      {leftRemoteState ? (
+                        <span class={`status-dot sm ${dotClassForState(leftRemoteState)}`} />
+                      ) : (
+                        <Icon name="folder" size={13} />
+                      )}
+                      <span>{leftTabLabel}</span>
                     </span>
                     {activeTab === 'local' && <Icon name="check" size={13} />}
                   </button>
@@ -1227,7 +1590,12 @@ function App() {
                     }}
                   >
                     <span class="compact-tab-trigger-left">
-                      <Icon name="plug" size={13} /> Remoto
+                      {rightRemoteState ? (
+                        <span class={`status-dot sm ${dotClassForState(rightRemoteState)}`} />
+                      ) : (
+                        <Icon name="server" size={13} />
+                      )}
+                      <span>{rightTabLabel}</span>
                     </span>
                     {activeTab === 'remote' && <Icon name="check" size={13} />}
                   </button>
@@ -1239,7 +1607,7 @@ function App() {
                     }}
                   >
                     <span class="compact-tab-trigger-left">
-                      <Icon name="sync" size={13} /> Transferências
+                      <Icon name="arrows-up-down" size={13} /> Transferências
                     </span>
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                       {renderTransferBadge()}
@@ -1256,16 +1624,20 @@ function App() {
                 aria-selected={activeTab === 'local'}
                 class={`seg-tab ${activeTab === 'local' ? 'active' : ''}`}
                 onClick={() => selectTab('local')}
+                title={leftTabLabel}
               >
-                <span>Local</span>
+                {leftRemoteState && <span class={`status-dot sm ${dotClassForState(leftRemoteState)}`} />}
+                <span>{leftTabLabel}</span>
               </button>
               <button
                 role="tab"
                 aria-selected={activeTab === 'remote'}
                 class={`seg-tab ${activeTab === 'remote' ? 'active' : ''}`}
                 onClick={() => selectTab('remote')}
+                title={rightTabLabel}
               >
-                <span>Remoto</span>
+                {rightRemoteState && <span class={`status-dot sm ${dotClassForState(rightRemoteState)}`} />}
+                <span>{rightTabLabel}</span>
               </button>
               <button
                 role="tab"
@@ -1281,8 +1653,8 @@ function App() {
           )}
 
           <div class="workspace-body">
-            {activeTab === 'local' && localPane}
-            {activeTab === 'remote' && remotePane}
+            {activeTab === 'local' && leftPaneEl}
+            {activeTab === 'remote' && rightPaneEl}
             {activeTab === 'transfers' && (
               <TransferPanel
                 snapshot={transfers}
@@ -1295,12 +1667,12 @@ function App() {
         </>
       )}
 
-      {/* Mode 2: Split Layout (Electerm — active when >= 520px and Split chosen) */}
+      {/* Mode 2: Split Layout (active when >= 520px and Split chosen) */}
       {effectiveLayout === 'split' && (
         <div class="workspace-body">
           <div ref={splitContainerRef} class="split-container">
             <div class="split-pane" style={{ width: `${splitRatio}%` }}>
-              {localPane}
+              {leftPaneEl}
             </div>
             <div
               class={`split-divider ${draggingSplit ? 'dragging' : ''}`}
@@ -1311,7 +1683,7 @@ function App() {
               title="Arraste para redimensionar"
             />
             <div class="split-pane" style={{ width: `${100 - splitRatio}%` }}>
-              {remotePane}
+              {rightPaneEl}
             </div>
           </div>
 
@@ -1351,53 +1723,77 @@ function App() {
         </div>
       )}
 
-      {/* Shared Full-Panel Overlays: QuickEditor, ImagePreview, LogTailViewer */}
-      {editorFile && (
-        <QuickEditor
-          file={editorFile}
-          onSave={async (nextContent) => {
-            const res = await requestWorker('editor.write', {
-              side: editorFile.side,
-              path: editorFile.path,
-              content: nextContent,
-              hostId: editorFile.hostId
-            })
-            setEditorFile((prev) =>
-              prev ? { ...prev, content: nextContent, mtimeMs: res.mtimeMs, size: res.size } : null
-            )
-            notify(`Salvo: ${editorFile.name}`)
-            void refreshSide(editorFile.side)
-          }}
-          onReload={async () => {
-            const fresh = await requestWorker('editor.read', {
-              side: editorFile.side,
-              path: editorFile.path,
-              hostId: editorFile.hostId,
-              forceText: true
-            })
-            setEditorFile(fresh)
-            notify('Arquivo recarregado')
-          }}
-          onClose={() => setEditorFile(null)}
+      {/* Full-Panel Connections Manager Overlay */}
+      {connectionsOpen && (
+        <ConnectionsManager
+          hosts={hosts}
+          hostStates={hostStates}
+          leftEndpoint={leftPane.endpoint || { kind: 'local' }}
+          rightEndpoint={rightPane.endpoint}
+          onClose={() => setConnectionsOpen(false)}
+          onConnect={(id, force) => connectHostById(id, { forceReconnect: force })}
+          onDisconnect={disconnectHostById}
+          onAssignToPane={selectPaneEndpoint}
+          onEditHost={(profile) => setModal({ kind: 'host', initial: profile })}
+          onRefreshHosts={refreshHostsList}
         />
       )}
 
-      {previewImage && (
+      {/* Shared Full-Panel Overlays: QuickEditor, ImagePreview, LogTailViewer */}
+      {editorState && (
+        <QuickEditor
+          file={editorState.file}
+          onSave={async (nextContent) => {
+            const { file, paneId } = editorState
+            const res = await requestWorker('editor.write', {
+              side: file.side,
+              path: file.path,
+              content: nextContent,
+              hostId: file.hostId
+            })
+            setEditorState((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    file: { ...prev.file, content: nextContent, mtimeMs: res.mtimeMs, size: res.size }
+                  }
+                : null
+            )
+            notify(`Salvo: ${file.name}`)
+            void refreshPane(paneId)
+          }}
+          onReload={async () => {
+            const { file, paneId } = editorState
+            const fresh = await requestWorker('editor.read', {
+              side: file.side,
+              path: file.path,
+              hostId: file.hostId,
+              forceText: true
+            })
+            setEditorState({ paneId, file: fresh })
+            notify('Arquivo recarregado')
+          }}
+          onClose={() => setEditorState(null)}
+        />
+      )}
+
+      {previewState && (
         <ImagePreview
-          image={previewImage}
-          canTransfer={connection.connected}
+          image={previewState.image}
+          canTransfer={previewState.paneId === 'left' ? canTransferLeftToRight : canTransferRightToLeft}
           onTransfer={() => {
-            void enqueueTransfer(previewImage.side, [
+            const { image, paneId } = previewState
+            void enqueueTransfer(paneId, [
               {
-                name: previewImage.name,
-                path: previewImage.path,
+                name: image.name,
+                path: image.path,
                 isDirectory: false,
                 isSymlink: false,
-                size: previewImage.size,
+                size: image.size,
                 mtimeMs: Date.now(),
                 mode: 0o100644,
                 permissions: '',
-                isHidden: previewImage.name.startsWith('.'),
+                isHidden: image.name.startsWith('.'),
                 isArchive: false,
                 archiveType: null,
                 isEditableText: false,
@@ -1405,41 +1801,32 @@ function App() {
               }
             ])
           }}
-          onClose={() => setPreviewImage(null)}
+          onClose={() => setPreviewState(null)}
         />
       )}
 
       {tailSession && <LogTailViewer session={tailSession} onStop={closeLogTail} />}
+      </div>
 
       {/* Floating Quick Hub Popover (triggered by Status Bar item or ⚡ button) */}
       {hubOpen && (
         <QuickHubPopover
-          connection={connection}
           hosts={hosts}
+          hostStates={hostStates}
+          leftEndpoint={leftPane.endpoint || { kind: 'local' }}
+          rightEndpoint={rightPane.endpoint}
           transfers={transfers}
           syncBrowsing={syncBrowsing}
           layout={effectiveLayout}
           canSplit={canSplit}
           onClose={() => setHubOpen(false)}
-          onConnectHost={(id) => void connectHost(id)}
-          onDisconnect={() => {
-            void requestWorker('connection.disconnect').then((r) => {
-              setConnection(r.connection)
-              setRemoteEntries([])
-              notify('Desconectado')
-            })
-          }}
+          onConnectHost={(id, force) => void connectHostById(id, { forceReconnect: force })}
+          onDisconnectHost={(id) => void disconnectHostById(id)}
+          onOpenConnectionsManager={() => setConnectionsOpen(true)}
           onToggleSync={toggleSyncBrowsing}
           onSyncWorkspace={() => void handleSyncWorkspace()}
           onToggleLayout={toggleLayout}
-          onRefreshHosts={() => {
-            void requestWorker('hosts.list')
-              .then((r) => {
-                setHosts(r.hosts)
-                notify(`${r.hosts.length} host(s) atualizado(s)`)
-              })
-              .catch((err) => notify(err instanceof Error ? err.message : String(err), true))
-          }}
+          onRefreshHosts={refreshHostsList}
           onNewHost={() => setModal({ kind: 'host' })}
           onOpenFullTransfers={() => {
             if (effectiveLayout === 'split') setDrawerOpen(true)
@@ -1456,7 +1843,7 @@ function App() {
       {modal?.kind === 'host' && (
         <HostModal
           initial={modal.initial}
-          onSave={handleSaveHost}
+          onSave={(input) => handleSaveHost(input, modal.attachToPane)}
           onDelete={handleDeleteHost}
           onClose={() => setModal(null)}
         />
@@ -1464,19 +1851,21 @@ function App() {
 
       {modal?.kind === 'mkdir' && (
         <PromptModal
-          title={`Nova pasta (${modal.side === 'remote' ? 'Remoto' : 'Local'})`}
+          title={`Nova pasta (${getEndpointTitle(getPane(modal.paneId).endpoint)})`}
           label="Nome da pasta"
           placeholder="minha-pasta"
           confirmLabel="Criar pasta"
           onConfirm={async (name) => {
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
             await requestWorker('fs.mkdir', {
-              side: modal.side,
-              parentPath: modal.side === 'local' ? localPath : remotePath,
+              side: pane.endpoint.kind,
+              parentPath: pane.path,
               name,
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             })
             notify(`Pasta "${name}" criada`)
-            await refreshSide(modal.side)
+            await refreshPane(modal.paneId)
           }}
           onClose={() => setModal(null)}
         />
@@ -1484,29 +1873,35 @@ function App() {
 
       {modal?.kind === 'newFile' && (
         <PromptModal
-          title={`Novo arquivo (${modal.side === 'remote' ? 'Remoto' : 'Local'})`}
+          title={`Novo arquivo (${getEndpointTitle(getPane(modal.paneId).endpoint)})`}
           label="Nome do arquivo"
           placeholder="notas.md"
           confirmLabel="Criar e abrir"
           onConfirm={async (name) => {
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
+            const hostId = pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             const res = await requestWorker('fs.createFile', {
-              side: modal.side,
-              parentPath: modal.side === 'local' ? localPath : remotePath,
+              side: pane.endpoint.kind,
+              parentPath: pane.path,
               name,
               content: '',
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId
             })
             notify(`Arquivo "${name}" criado`)
-            await refreshSide(modal.side)
-            setEditorFile({
-              side: modal.side,
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined,
-              path: res.createdPath,
-              name,
-              content: '',
-              size: 0,
-              mtimeMs: Date.now(),
-              encoding: 'utf-8'
+            await refreshPane(modal.paneId)
+            setEditorState({
+              paneId: modal.paneId,
+              file: {
+                side: pane.endpoint.kind,
+                hostId,
+                path: res.createdPath,
+                name,
+                content: '',
+                size: 0,
+                mtimeMs: Date.now(),
+                encoding: 'utf-8'
+              }
             })
           }}
           onClose={() => setModal(null)}
@@ -1520,14 +1915,16 @@ function App() {
           initialValue={modal.entry.name}
           confirmLabel="Renomear"
           onConfirm={async (newName) => {
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
             await requestWorker('fs.rename', {
-              side: modal.side,
+              side: pane.endpoint.kind,
               oldPath: modal.entry.path,
               newName,
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             })
             notify(`Renomeado para "${newName}"`)
-            await refreshSide(modal.side)
+            await refreshPane(modal.paneId)
           }}
           onClose={() => setModal(null)}
         />
@@ -1541,14 +1938,16 @@ function App() {
           initialValue={formatModeOctal(modal.entry.mode)}
           confirmLabel="Aplicar"
           onConfirm={async (mode) => {
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
             await requestWorker('fs.chmod', {
-              side: modal.side,
+              side: pane.endpoint.kind,
               path: modal.entry.path,
               mode,
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             })
             notify(`Permissões alteradas para ${mode}`)
-            await refreshSide(modal.side)
+            await refreshPane(modal.paneId)
           }}
           onClose={() => setModal(null)}
         />
@@ -1560,17 +1959,18 @@ function App() {
           entries={modal.entries}
           defaultFormat={modal.defaultFormat || settings.defaultArchiveFormat}
           onConfirm={async (archiveName, format) => {
-            const cwd = modal.side === 'local' ? localPath : remotePath
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
             const res = await requestWorker('fs.compress', {
-              side: modal.side,
-              cwd,
+              side: pane.endpoint.kind,
+              cwd: pane.path,
               names: modal.entries.map((e) => e.name),
               archiveName,
               format,
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             })
             notify(`Compactado: ${posixBasename(res.archivePath)}`)
-            await refreshSide(modal.side)
+            await refreshPane(modal.paneId)
           }}
           onClose={() => setModal(null)}
         />
@@ -1581,13 +1981,15 @@ function App() {
           side={modal.side}
           entries={modal.entries}
           onConfirm={async () => {
+            const pane = getPane(modal.paneId)
+            if (!pane.endpoint) return
             const res = await requestWorker('fs.delete', {
-              side: modal.side,
+              side: pane.endpoint.kind,
               paths: modal.entries.map((e) => e.path),
-              hostId: modal.side === 'remote' ? connection.hostId || undefined : undefined
+              hostId: pane.endpoint.kind === 'remote' ? pane.endpoint.hostId : undefined
             })
             notify(`${res.deletedCount} item(ns) excluído(s)`)
-            await refreshSide(modal.side)
+            await refreshPane(modal.paneId)
           }}
           onClose={() => setModal(null)}
         />
@@ -1596,27 +1998,43 @@ function App() {
       {modal?.kind === 'conflict' && (
         <ConflictModal
           direction={modal.direction}
+          sourceLabel={modal.sourceLabel}
+          targetLabel={modal.targetLabel}
           totalCount={modal.entries.length}
           conflicts={modal.conflicts}
-          onRequestDiff={(conflict) =>
-            requestWorker('transfers.diffConflict', {
-              hostId: connection.hostId || undefined,
+          onRequestDiff={(conflict) => {
+            const srcEp = getPane(modal.fromPane).endpoint
+            const dstEp = getPane(otherPaneId(modal.fromPane)).endpoint
+            const sourceHostId = srcEp?.kind === 'remote' ? srcEp.hostId : undefined
+            const targetHostId = dstEp?.kind === 'remote' ? dstEp.hostId : undefined
+            return requestWorker('transfers.diffConflict', {
+              hostId: targetHostId || sourceHostId || connection.hostId || undefined,
               direction: modal.direction,
+              sourceSide: srcEp?.kind,
+              sourceHostId,
+              targetSide: dstEp?.kind,
+              targetHostId,
               sourcePath: conflict.sourcePath,
               targetPath: conflict.targetPath
             })
-          }
+          }}
           onOverwrite={async (backupBeforeOverwrite) => {
-            await dispatchEnqueue(modal.fromSide, modal.entries, modal.priority, undefined, backupBeforeOverwrite)
+            await dispatchEnqueue(
+              modal.fromPane,
+              modal.entries,
+              modal.priority,
+              undefined,
+              backupBeforeOverwrite
+            )
           }}
           onRename={async (customNames) => {
-            await dispatchEnqueue(modal.fromSide, modal.entries, modal.priority, customNames, false)
+            await dispatchEnqueue(modal.fromPane, modal.entries, modal.priority, customNames, false)
           }}
           onSkip={async () => {
             const conflictSet = new Set(modal.conflicts.map((c) => c.sourcePath))
             const nonConflicting = modal.entries.filter((e) => !conflictSet.has(e.path))
             if (nonConflicting.length > 0) {
-              await dispatchEnqueue(modal.fromSide, nonConflicting, modal.priority)
+              await dispatchEnqueue(modal.fromPane, nonConflicting, modal.priority)
             }
           }}
           onClose={() => setModal(null)}

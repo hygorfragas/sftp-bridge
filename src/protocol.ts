@@ -6,6 +6,7 @@ import type {
   EditorFilePayload,
   FileEntry,
   HostProfile,
+  HostSftpState,
   ImagePreviewPayload,
   PersistedSessionState,
   PluginUserSettings,
@@ -30,6 +31,7 @@ declare module 'orca' {
         settings: PluginUserSettings
         hosts: HostProfile[]
         connection: ConnectionStatus
+        hostStates: Record<string, HostSftpState>
         transfers: TransferSnapshot
         bookmarks: BookmarkEntry[]
         workspaceHint: WorkspaceHint
@@ -43,7 +45,7 @@ declare module 'orca' {
 
     // Host discovery & connection management
     'hosts.list': {
-      output: { hosts: HostProfile[] }
+      output: { hosts: HostProfile[]; hostStates: Record<string, HostSftpState> }
     }
     'hosts.save': {
       input: SaveHostInput
@@ -54,11 +56,18 @@ declare module 'orca' {
       output: { hosts: HostProfile[] }
     }
     'connection.connect': {
-      input: { hostId: string }
-      output: { connection: ConnectionStatus; remotePath: string; entries: FileEntry[] }
+      input: { hostId: string; forceReconnect?: boolean }
+      output: {
+        connection: ConnectionStatus
+        hostState: HostSftpState
+        hostStates: Record<string, HostSftpState>
+        remotePath: string
+        entries: FileEntry[]
+      }
     }
     'connection.disconnect': {
-      output: { connection: ConnectionStatus }
+      input: { hostId?: string }
+      output: { connection: ConnectionStatus; hostStates: Record<string, HostSftpState> }
     }
 
     // File system navigation & CRUD (local or remote)
@@ -161,6 +170,10 @@ declare module 'orca' {
     'transfers.checkConflicts': {
       input: {
         hostId?: string
+        sourceSide?: Side
+        sourceHostId?: string
+        targetSide?: Side
+        targetHostId?: string
         direction: TransferDirection
         items: {
           sourcePath: string
@@ -176,6 +189,10 @@ declare module 'orca' {
     'transfers.diffConflict': {
       input: {
         hostId?: string
+        sourceSide?: Side
+        sourceHostId?: string
+        targetSide?: Side
+        targetHostId?: string
         direction: TransferDirection
         sourcePath: string
         targetPath: string
@@ -185,6 +202,10 @@ declare module 'orca' {
     'transfers.enqueue': {
       input: {
         hostId?: string
+        sourceSide?: Side
+        sourceHostId?: string
+        targetSide?: Side
+        targetHostId?: string
         direction: TransferDirection
         items: {
           sourcePath: string
@@ -234,6 +255,7 @@ declare module 'orca' {
   interface PluginPanelEvents {
     'transfers.updated': TransferSnapshot
     'connection.updated': ConnectionStatus
+    'hostStates.updated': Record<string, HostSftpState>
     'workspace.hint': WorkspaceHint
     'hosts.updated': { hosts: HostProfile[] }
     'tail.data': { tailId: string; chunk: string }

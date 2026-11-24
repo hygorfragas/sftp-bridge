@@ -6,7 +6,11 @@ import type { RemoteTransport } from '../src/worker/transport-types.ts'
 import { TransferManager } from '../src/worker/transfer-manager.ts'
 
 /** In-memory fake RemoteTransport supporting byte-offset reads/writes for deterministic tests. */
-function createMemoryTransport(delayMs = 5): RemoteTransport & { files: Map<string, Buffer> } {
+function createMemoryTransport(
+  delayMs = 5,
+  hostId = 'test-host',
+  hostName = 'Test Host'
+): RemoteTransport & { files: Map<string, Buffer> } {
   const files = new Map<string, Buffer>()
   const handles = new Map<string, string>()
   let nextHandle = 1
@@ -14,8 +18,8 @@ function createMemoryTransport(delayMs = 5): RemoteTransport & { files: Map<stri
   const wait = () => new Promise<void>((r) => setTimeout(r, delayMs))
 
   return {
-    hostId: 'test-host',
-    hostName: 'Test Host',
+    hostId,
+    hostName,
     mode: 'ssh2-sftp',
     isAlive: true,
     files,
@@ -288,4 +292,61 @@ test('TransferManager creates .bak backup before overwriting when backupBeforeOv
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('TransferManager streams Remote A -> Remote B in memory with pause/resume and .bak backup', async () => {
+  const transportA = createMemoryTransport(6, 'host-a', 'Alpha Server')
+  const transportB = createMemoryTransport(6, 'host-b', 'Beta Server')
+
+  // 256 KB payload on Server A + existing file on Server B to test .bak backup
+  const payload = Buffer.alloc(256 * 1024, 0x5a)
+  for (let i = 0; i < payload.length; i += 2048) payload[i] = (i / 2048) % 251
+  transportA.files.set('/srv/data/bundle.bin', payload)
+  transportB.files.set('/opt/dest/bundle.bin', Buffer.from('OLD-BETA-CONTENT'))
+
+  const manager = new TransferManager(
+    {
+      getTransport: async (hostId) => (hostId === 'host-a' ? transportA : transportB),
+      onSnapshot: () => {}
+    },
+    1
+  )
+
+  const snap = manager.enqueue({
+    hostId: 'host-b',
+    hostName: 'Alpha Server → Beta Server',
+    direction: 'remote-to-remote',
+    sourceSide: 'remote',
+    sourceHostId: 'host-a',
+    sourceHostName: 'Alpha Server',
+    targetSide: 'remote',
+    targetHostId: 'host-b',
+    targetHostName: 'Beta Server',
+    items: [
+      {
+        sourcePath: '/srv/data/bundle.bin',
+        targetDir: '/opt/dest',
+        isDirectory: false,
+        name: 'bundle.bin',
+        backupBeforeOverwrite: true,
+        size: payload.length
+      }
+    ]
+  })
+  const txId = snap.items[0].id
+  assert.equal(snap.items[0].direction, 'remote-to-remote')
+
+  // Pause mid-stream and resume from exact byte offset
+  await waitFor(() => (manager.getSnapshot().items[0]?.bytesTransferred || 0) >= 64 * 1024)
+  manager.pause(txId)
+  await waitFor(() => manager.getSnapshot().items[0]?.status === 'paused')
+  const pausedAt = manager.getSnapshot().items[0].bytesTransferred
+  assert.ok(pausedAt >= 64 * 1024 && pausedAt < payload.length)
+
+  manager.resume(txId)
+  await waitFor(() => manager.getSnapshot().items[0]?.status === 'completed')
+
+  const destBuf = transportB.files.get('/opt/dest/bundle.bin')
+  assert.ok(destBuf && destBuf.equals(payload))
+  assert.equal(transportB.files.get('/opt/dest/bundle.bin.bak')?.toString('utf8'), 'OLD-BETA-CONTENT')
 })

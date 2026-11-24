@@ -74,10 +74,12 @@ async function stageCleanPluginDir() {
   const stage = resolve(root, 'plugin')
   await mkdir(resolve(stage, 'dist'), { recursive: true })
   await mkdir(resolve(stage, 'panel'), { recursive: true })
+  await mkdir(resolve(stage, 'assets'), { recursive: true })
   await Promise.all([
     copyFile(resolve(root, 'orca-plugin.json'), resolve(stage, 'orca-plugin.json')),
     copyFile(resolve(root, 'LICENSE'), resolve(stage, 'LICENSE')),
     copyFile(resolve(root, 'README.md'), resolve(stage, 'README.md')),
+    copyFile(resolve(root, 'assets/icon.png'), resolve(stage, 'assets/icon.png')),
     copyFile(resolve(root, 'dist/worker.mjs'), resolve(stage, 'dist/worker.mjs')),
     copyFile(resolve(root, 'panel/index.html'), resolve(stage, 'panel/index.html')),
     copyFile(resolve(root, 'panel/app.js'), resolve(stage, 'panel/app.js')),

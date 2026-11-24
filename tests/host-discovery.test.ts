@@ -1,4 +1,5 @@
 import { assert, test } from 'orca/testing'
+import { deduplicateHostsForDisplay } from '../src/shared/host-display.ts'
 import { mergeDiscoveredHosts, parseSshConfig } from '../src/worker/host-discovery.ts'
 
 test('parseSshConfig parses aliases, hostnames, ports, users and ignores wildcards', () => {
@@ -89,4 +90,24 @@ test('mergeDiscoveredHosts unifies Orca SSH hosts, ssh-tunnel environments and V
 
   const extra = hosts.find((h) => h.id === 'ssh-config:extra-box')
   assert.ok(extra)
+
+  // Verify orcaStatus & deduplication of wrapped orca-ssh hosts
+  assert.equal(tunnelEnv.orcaStatus, 'connected')
+  assert.equal(matchedVpnEnv.orcaStatus, 'connected')
+  const deduped = deduplicateHostsForDisplay(hosts, {})
+  assert.equal(deduped.some((h) => h.id === 'orca-env:env-tunnel'), true)
+  assert.equal(deduped.some((h) => h.id === 'orca-ssh:ssh-1'), false)
+})
+
+test('mergeDiscoveredHosts maps connecting status from Orca hosts', () => {
+  const hosts = mergeDiscoveredHosts({
+    orcaHosts: [
+      { kind: 'ssh', name: 'reconnecting-box', id: 'ssh-2', connected: false, connectionStatus: 'connecting' }
+    ],
+    orcaEnvs: [],
+    sshConfigHosts: [],
+    savedBindings: []
+  })
+  assert.equal(hosts[0]?.orcaStatus, 'connecting')
+  assert.equal(hosts[0]?.connected, false)
 })

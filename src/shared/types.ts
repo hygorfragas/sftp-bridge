@@ -1,5 +1,24 @@
 export type Side = 'local' | 'remote'
 
+export type PaneId = 'left' | 'right'
+
+export type PaneEndpoint =
+  | { kind: 'local' }
+  | { kind: 'remote'; hostId: string }
+
+export type HostConnectionState = 'connected' | 'connecting' | 'disconnected' | 'error'
+
+export interface HostSftpState {
+  hostId: string
+  hostName: string
+  state: HostConnectionState
+  /** 'orca' when synced from an already-connected Orca host (opens SFTP seamlessly on demand) */
+  source?: 'orca' | 'sftp'
+  transportMode?: 'openssh-sftp' | 'ssh2-sftp'
+  remoteHome?: string
+  error?: string
+}
+
 export type LayoutMode = 'tabs' | 'split'
 
 export type HostKind = 'orca-ssh' | 'orca-env' | 'ssh-config' | 'manual'
@@ -14,6 +33,8 @@ export interface HostProfile {
   sourceLabel: string
   /** Whether Orca currently reports this host as connected */
   connected?: boolean
+  /** Live connection status reported by Orca for Orca-managed hosts */
+  orcaStatus?: 'connected' | 'connecting' | 'disconnected'
   /** OpenSSH alias (from Orca SSH host or ~/.ssh/config) */
   sshAlias?: string
   /** Resolved hostname or VPN IP */
@@ -45,6 +66,8 @@ export interface PersistedSessionState {
   layout?: LayoutMode
   splitRatio?: number
   syncBrowsing?: boolean
+  leftEndpoint?: PaneEndpoint
+  rightEndpoint?: PaneEndpoint | null
 }
 
 export interface SaveHostInput {
@@ -132,7 +155,7 @@ export type ArchiveType =
   | '7z'
   | 'rar'
 
-export type TransferDirection = 'upload' | 'download'
+export type TransferDirection = 'upload' | 'download' | 'remote-to-remote'
 
 export type TransferStatus =
   | 'queued'
@@ -148,6 +171,12 @@ export interface TransferItem {
   id: string
   hostId: string
   hostName: string
+  sourceSide: Side
+  sourceHostId?: string
+  sourceHostName?: string
+  targetSide: Side
+  targetHostId?: string
+  targetHostName?: string
   direction: TransferDirection
   sourcePath: string
   targetPath: string

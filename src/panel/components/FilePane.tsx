@@ -1,14 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { formatBytes, formatTimestamp, posixDirname } from '../../shared/file-utils.ts'
-import type { BookmarkEntry, FileEntry, SearchResultEntry, Side } from '../../shared/types.ts'
+import { deduplicateHostsForDisplay } from '../../shared/host-display.ts'
+import type {
+  BookmarkEntry,
+  FileEntry,
+  HostConnectionState,
+  HostProfile,
+  HostSftpState,
+  PaneEndpoint,
+  PaneId,
+  SearchResultEntry,
+  Side,
+  TransferDirection
+} from '../../shared/types.ts'
 import { Icon } from './Icons.tsx'
 
 type SortField = 'name' | 'size' | 'mtime'
 type SortDir = 'asc' | 'desc'
 
 export interface FilePaneProps {
+  paneId: PaneId
   side: Side
+  endpoint: PaneEndpoint | null
   title: string
+  hostState?: HostSftpState
+  hosts: HostProfile[]
+  hostStates: Record<string, HostSftpState>
+  otherPaneTitle?: string
+  transferDirection?: TransferDirection | null
   path: string
   homePath: string
   entries: FileEntry[]
@@ -19,6 +38,8 @@ export interface FilePaneProps {
   narrow?: boolean
   bookmarks: BookmarkEntry[]
   selectedPaths: Set<string>
+  onSelectEndpoint: (endpoint: PaneEndpoint) => void
+  onOpenConnectionsManager: () => void
   onToggleHidden: () => void
   onNavigate: (path: string, relativeAction?: { kind: 'enter'; name: string } | { kind: 'up' }) => void
   onRefresh: () => void
@@ -27,12 +48,22 @@ export interface FilePaneProps {
   onOpenEntry: (entry: FileEntry) => void
   onContextMenu: (e: MouseEvent, entries: FileEntry[]) => void
   onTransferSelected: (entries: FileEntry[]) => void
-  onDropFromOtherSide: (entries: FileEntry[]) => void
+  onDropFromOtherPane: (entries: FileEntry[]) => void
   onDropExternalFiles?: (files: FileList) => void
   onRecursiveSearch: (query: string) => Promise<{ results: SearchResultEntry[]; truncated: boolean }>
   onOpenSearchResult: (result: SearchResultEntry) => void
   canTransfer: boolean
-  disconnectedAction?: { label: string; onClick: () => void; hint: string }
+  disconnectedAction?: { label: string; onClick: () => void; hint: string; secondaryLabel?: string; onSecondaryClick?: () => void }
+}
+
+function getRealState(hostId: string, hostStates: Record<string, HostSftpState>): HostConnectionState {
+  return hostStates[hostId]?.state || 'disconnected'
+}
+
+function dotClass(state: HostConnectionState): string {
+  if (state === 'connected') return 'connected'
+  if (state === 'connecting') return 'connecting'
+  return 'disconnected'
 }
 
 export function FilePane(props: FilePaneProps) {
@@ -47,7 +78,9 @@ export function FilePane(props: FilePaneProps) {
   const [dragOver, setDragOver] = useState(false)
   const [dragHint, setDragHint] = useState<string | null>(null)
   const [showBookmarks, setShowBookmarks] = useState(false)
+  const [endpointMenuOpen, setEndpointMenuOpen] = useState(false)
   const lastClickedIdx = useRef<number>(-1)
+  const endpointMenuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     setPathDraft(props.path)
@@ -55,6 +88,25 @@ export function FilePane(props: FilePaneProps) {
       setRecursiveResults([])
     }
   }, [props.path])
+
+  // Close endpoint selector menu on outside click / Escape
+  useEffect(() => {
+    if (!endpointMenuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (endpointMenuRef.current && !endpointMenuRef.current.contains(e.target as Node)) {
+        setEndpointMenuOpen(false)
+      }
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setEndpointMenuOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [endpointMenuOpen])
 
   // Debounced recursive subfolder search
   useEffect(() => {
@@ -122,6 +174,24 @@ export function FilePane(props: FilePaneProps) {
     [props.bookmarks, props.side]
   )
 
+  // Sort hosts for the pane endpoint picker: active SFTP/Orca sessions first, then available hosts.
+  // Hide hosts currently in 'connecting' state (user can monitor/reconnect them in Orca or Connections Manager).
+  const sortedMenuHosts = useMemo(() => {
+    const inUse = new Set<string>()
+    if (props.endpoint?.kind === 'remote') inUse.add(props.endpoint.hostId)
+    const uniqueHosts = deduplicateHostsForDisplay(props.hosts, props.hostStates, inUse)
+
+    const connected: HostProfile[] = []
+    const others: HostProfile[] = []
+    for (const h of uniqueHosts) {
+      const st = getRealState(h.id, props.hostStates)
+      if (st === 'connecting') continue
+      if (st === 'connected') connected.push(h)
+      else others.push(h)
+    }
+    return { connected, others }
+  }, [props.endpoint, props.hosts, props.hostStates])
+
   const toggleSort = (field: SortField) => {
     if (sortField === field) {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
@@ -177,7 +247,7 @@ export function FilePane(props: FilePaneProps) {
     const dragging = props.selectedPaths.has(entry.path) ? getSelectedEntries() : [entry]
     e.dataTransfer?.setData(
       'application/x-orca-sftp-entries',
-      JSON.stringify({ side: props.side, entries: dragging })
+      JSON.stringify({ paneId: props.paneId, side: props.side, entries: dragging })
     )
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy'
   }
@@ -189,12 +259,14 @@ export function FilePane(props: FilePaneProps) {
       e.preventDefault()
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
       setDragOver(true)
-      setDragHint(props.side === 'remote' ? 'Solte para enviar ao servidor' : 'Solte para baixar')
+      setDragHint(
+        props.side === 'remote' ? `Solte para enviar para ${props.title}` : 'Solte para baixar para Local'
+      )
     } else if (props.side === 'remote' && props.onDropExternalFiles && types.includes('Files')) {
       e.preventDefault()
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
       setDragOver(true)
-      setDragHint('Solte arquivos do Finder para enviar ao servidor')
+      setDragHint(`Solte arquivos do Finder para enviar para ${props.title}`)
     }
   }
 
@@ -207,9 +279,10 @@ export function FilePane(props: FilePaneProps) {
     const raw = e.dataTransfer?.getData('application/x-orca-sftp-entries')
     if (raw) {
       try {
-        const parsed = JSON.parse(raw) as { side: Side; entries: FileEntry[] }
-        if (parsed.side !== props.side && Array.isArray(parsed.entries) && parsed.entries.length) {
-          props.onDropFromOtherSide(parsed.entries)
+        const parsed = JSON.parse(raw) as { paneId?: PaneId; side: Side; entries: FileEntry[] }
+        const isFromOther = parsed.paneId ? parsed.paneId !== props.paneId : parsed.side !== props.side
+        if (isFromOther && Array.isArray(parsed.entries) && parsed.entries.length) {
+          props.onDropFromOtherPane(parsed.entries)
         }
       } catch {
         // ignore
@@ -234,17 +307,186 @@ export function FilePane(props: FilePaneProps) {
     return 'file'
   }
 
+  const isLocal = props.endpoint?.kind === 'local'
+  const currentHostId = props.endpoint?.kind === 'remote' ? props.endpoint.hostId : null
+  const currentRemoteState: HostConnectionState = currentHostId
+    ? props.hostState?.state || getRealState(currentHostId, props.hostStates)
+    : 'disconnected'
+
+  const renderEndpointSubbar = () => {
+    const transferIcon =
+      props.transferDirection === 'remote-to-remote'
+        ? 'arrows-up-down'
+        : props.transferDirection === 'download'
+          ? 'download'
+          : 'upload'
+    const transferText =
+      props.transferDirection === 'remote-to-remote'
+        ? props.narrow
+          ? 'Enviar'
+          : `Enviar → ${props.otherPaneTitle || 'Remoto'}`
+        : props.transferDirection === 'download'
+          ? 'Baixar'
+          : 'Enviar'
+
+    return (
+      <div class="pane-subbar">
+        <div ref={endpointMenuRef} class="pane-endpoint-wrap">
+          <button
+            class={`pane-endpoint-btn ${endpointMenuOpen ? 'open' : ''}`}
+            title={
+              isLocal
+                ? 'Clique para trocar este painel por outro servidor remoto (Remoto × Remoto)'
+                : `${props.title} — clique para trocar servidor ou alternar para Local`
+            }
+            onClick={() => setEndpointMenuOpen((v) => !v)}
+          >
+            {!isLocal && (
+              <span class={`status-dot sm ${dotClass(currentRemoteState)}`} />
+            )}
+            <span class="pane-endpoint-text">
+              {isLocal ? 'Local' : currentHostId ? `Remoto · ${props.title}` : 'Remoto · Selecionar'}
+            </span>
+            <span class="pane-endpoint-chevron">
+              <Icon name="chevron-down" size={11} />
+            </span>
+          </button>
+
+          {endpointMenuOpen && (
+            <div class="pane-endpoint-menu" role="menu">
+              <div class="pane-endpoint-menu-section">Origem deste painel</div>
+              <button
+                class={`pane-endpoint-option ${isLocal ? 'selected' : ''}`}
+                onClick={() => {
+                  setEndpointMenuOpen(false)
+                  props.onSelectEndpoint({ kind: 'local' })
+                }}
+              >
+                <span class="pane-endpoint-option-left">
+                  <Icon name="folder" size={12} />
+                  <span>Este computador (Local)</span>
+                </span>
+                {isLocal && <Icon name="check" size={12} />}
+              </button>
+
+              {sortedMenuHosts.connected.length > 0 && (
+                <>
+                  <div class="ctx-sep" />
+                  <div class="pane-endpoint-menu-section">Sessões SFTP ativas</div>
+                  {sortedMenuHosts.connected.map((h) => {
+                    const st = getRealState(h.id, props.hostStates)
+                    const active = currentHostId === h.id
+                    return (
+                      <button
+                        key={h.id}
+                        class={`pane-endpoint-option ${active ? 'selected' : ''}`}
+                        title={`${h.name} (${h.sourceLabel})`}
+                        onClick={() => {
+                          setEndpointMenuOpen(false)
+                          props.onSelectEndpoint({ kind: 'remote', hostId: h.id })
+                        }}
+                      >
+                        <span class="pane-endpoint-option-left">
+                          <span class={`status-dot sm ${dotClass(st)}`} />
+                          <span class="pane-endpoint-option-name">{h.name}</span>
+                        </span>
+                        {active && <Icon name="check" size={12} />}
+                      </button>
+                    )
+                  })}
+                </>
+              )}
+
+              {sortedMenuHosts.others.length > 0 && (
+                <>
+                  <div class="ctx-sep" />
+                  <div class="pane-endpoint-menu-section">Servidores disponíveis</div>
+                  {sortedMenuHosts.others.map((h) => {
+                    const st = getRealState(h.id, props.hostStates)
+                    const active = currentHostId === h.id
+                    return (
+                      <button
+                        key={h.id}
+                        class={`pane-endpoint-option ${active ? 'selected' : ''}`}
+                        title={`${h.name} (${h.sourceLabel})`}
+                        onClick={() => {
+                          setEndpointMenuOpen(false)
+                          props.onSelectEndpoint({ kind: 'remote', hostId: h.id })
+                        }}
+                      >
+                        <span class="pane-endpoint-option-left">
+                          <span class={`status-dot sm ${dotClass(st)}`} />
+                          <span class="pane-endpoint-option-name">{h.name}</span>
+                        </span>
+                        <span class="pane-endpoint-option-tag">
+                          {h.kind === 'orca-env' ? 'Orca' : h.kind === 'orca-ssh' ? 'SSH' : h.kind === 'ssh-config' ? 'cfg' : 'manual'}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </>
+              )}
+
+              <div class="ctx-sep" />
+              <button
+                class="pane-endpoint-option manage"
+                onClick={() => {
+                  setEndpointMenuOpen(false)
+                  props.onOpenConnectionsManager()
+                }}
+              >
+                <span class="pane-endpoint-option-left">
+                  <Icon name="server" size={12} />
+                  <span>Gerenciar conexões / Nova...</span>
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {props.connected && selectedEntries.length > 0 && props.canTransfer && (
+          <button
+            class="btn primary xs"
+            onClick={() => props.onTransferSelected(selectedEntries)}
+          >
+            <Icon name={transferIcon} size={11} />
+            {transferText} ({selectedEntries.length})
+          </button>
+        )}
+      </div>
+    )
+  }
+
   if (props.side === 'remote' && !props.connected) {
+    const isConnecting = currentRemoteState === 'connecting'
     return (
       <div class={`file-pane ${props.narrow ? 'narrow' : ''}`}>
+        {renderEndpointSubbar()}
         <div class="empty-state">
-          <Icon name="plug" size={26} />
-          <h3>Nenhum host remoto conectado</h3>
-          <p>{props.disconnectedAction?.hint || 'Selecione um Host SSH ou Servidor Orca Remoto no topo para navegar via SFTP.'}</p>
-          {props.disconnectedAction && (
-            <button class="btn primary" onClick={props.disconnectedAction.onClick}>
-              {props.disconnectedAction.label}
-            </button>
+          <Icon name={isConnecting ? 'refresh' : 'plug'} size={26} />
+          <h3>
+            {isConnecting
+              ? `Conectando a ${props.title}...`
+              : currentHostId
+                ? `${props.title} desconectado`
+                : 'Nenhum host remoto selecionado'}
+          </h3>
+          <p>
+            {props.error ||
+              props.disconnectedAction?.hint ||
+              'Clique no título acima para escolher um servidor ou abra o Gerenciador de Conexões.'}
+          </p>
+          {!isConnecting && props.disconnectedAction && (
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', justifyContent: 'center' }}>
+              <button class="btn primary" onClick={props.disconnectedAction.onClick}>
+                {props.disconnectedAction.label}
+              </button>
+              {props.disconnectedAction.secondaryLabel && props.disconnectedAction.onSecondaryClick && (
+                <button class="btn" onClick={props.disconnectedAction.onSecondaryClick}>
+                  {props.disconnectedAction.secondaryLabel}
+                </button>
+              )}
+            </div>
           )}
         </div>
       </div>
@@ -259,20 +501,7 @@ export function FilePane(props: FilePaneProps) {
       onDrop={handleDrop}
       onContextMenu={handleBgContextMenu}
     >
-      <div class="pane-subbar">
-        <span class="pane-label" title={props.title}>
-          {props.side === 'local' ? 'Local' : `Remoto · ${props.title}`}
-        </span>
-        {selectedEntries.length > 0 && props.canTransfer && (
-          <button
-            class="btn primary xs"
-            onClick={() => props.onTransferSelected(selectedEntries)}
-          >
-            <Icon name={props.side === 'local' ? 'upload' : 'download'} size={11} />
-            {props.side === 'local' ? 'Enviar' : 'Baixar'} ({selectedEntries.length})
-          </button>
-        )}
-      </div>
+      {renderEndpointSubbar()}
 
       <div class={`path-toolbar ${props.narrow ? 'compact' : ''}`}>
         <div class="path-toolbar-icons">

@@ -1,18 +1,29 @@
-import { useEffect, useRef } from 'preact/hooks'
+import { useEffect, useMemo, useRef } from 'preact/hooks'
 import { formatBytes, formatSpeed } from '../../shared/file-utils.ts'
-import type { ConnectionStatus, HostProfile, LayoutMode, TransferSnapshot } from '../../shared/types.ts'
+import { deduplicateHostsForDisplay } from '../../shared/host-display.ts'
+import type {
+  HostConnectionState,
+  HostProfile,
+  HostSftpState,
+  LayoutMode,
+  PaneEndpoint,
+  TransferSnapshot
+} from '../../shared/types.ts'
 import { Icon } from './Icons.tsx'
 
 export interface QuickHubPopoverProps {
-  connection: ConnectionStatus
   hosts: HostProfile[]
+  hostStates: Record<string, HostSftpState>
+  leftEndpoint: PaneEndpoint
+  rightEndpoint: PaneEndpoint | null
   transfers: TransferSnapshot
   syncBrowsing: boolean
   layout: LayoutMode
   canSplit: boolean
   onClose: () => void
-  onConnectHost: (hostId: string) => void
-  onDisconnect: () => void
+  onConnectHost: (hostId: string, forceReconnect?: boolean) => void
+  onDisconnectHost: (hostId: string) => void
+  onOpenConnectionsManager: () => void
   onToggleSync: () => void
   onSyncWorkspace: () => void
   onToggleLayout: () => void
@@ -23,6 +34,23 @@ export interface QuickHubPopoverProps {
     action: 'pause' | 'resume' | 'cancel' | 'pauseAll' | 'resumeAll' | 'clearCompleted',
     transferId?: string
   ) => void
+}
+
+function getState(hostId: string, map: Record<string, HostSftpState>): HostConnectionState {
+  return map[hostId]?.state || 'disconnected'
+}
+
+function dotClass(state: HostConnectionState): string {
+  if (state === 'connected') return 'connected'
+  if (state === 'connecting') return 'connecting'
+  return 'disconnected'
+}
+
+function stateText(state: HostConnectionState): string {
+  if (state === 'connected') return 'Conectado'
+  if (state === 'connecting') return 'Reconectando...'
+  if (state === 'error') return 'Erro'
+  return 'Desconectado'
 }
 
 export function QuickHubPopover(props: QuickHubPopoverProps) {
@@ -45,28 +73,77 @@ export function QuickHubPopover(props: QuickHubPopoverProps) {
     }
   }, [props])
 
-  const { transfers, connection, hosts } = props
+  const { transfers, hosts, hostStates, leftEndpoint, rightEndpoint } = props
   const recentTransfers = transfers.items.slice(0, 4)
-  const quickHosts = hosts.filter((h) => h.kind === 'orca-ssh' || h.kind === 'orca-env').slice(0, 6)
   const activeTotal = transfers.activeCount + transfers.queuedCount
+
+  const hostById = useMemo(() => {
+    const m = new Map<string, HostProfile>()
+    for (const h of hosts) m.set(h.id, h)
+    return m
+  }, [hosts])
+
+  const leftName =
+    leftEndpoint.kind === 'local' ? 'Local' : hostById.get(leftEndpoint.hostId)?.name || 'Remoto'
+  const rightName = !rightEndpoint
+    ? 'Desconectado'
+    : rightEndpoint.kind === 'local'
+      ? 'Local'
+      : hostById.get(rightEndpoint.hostId)?.name || 'Remoto'
+
+  // Deduplicate hosts preferring in-use or connected, hiding duplicate orca-ssh wrappers
+  const uniqueHosts = useMemo(() => {
+    const inUseIds = new Set<string>()
+    if (leftEndpoint.kind === 'remote') inUseIds.add(leftEndpoint.hostId)
+    if (rightEndpoint?.kind === 'remote') inUseIds.add(rightEndpoint.hostId)
+    return deduplicateHostsForDisplay(hosts, hostStates, inUseIds)
+  }, [hosts, hostStates, leftEndpoint, rightEndpoint])
+
+  const connectedStates = useMemo(
+    () => uniqueHosts.filter((h) => getState(h.id, hostStates) === 'connected'),
+    [uniqueHosts, hostStates]
+  )
+  const anyConnecting = useMemo(
+    () => uniqueHosts.some((h) => getState(h.id, hostStates) === 'connecting'),
+    [uniqueHosts, hostStates]
+  )
+  const overallDot: HostConnectionState = anyConnecting
+    ? 'connecting'
+    : connectedStates.length > 0
+      ? 'connected'
+      : 'disconnected'
+
+  const quickHosts = useMemo(() => {
+    const inUseIds = new Set<string>()
+    if (leftEndpoint.kind === 'remote') inUseIds.add(leftEndpoint.hostId)
+    if (rightEndpoint?.kind === 'remote') inUseIds.add(rightEndpoint.hostId)
+
+    return [...uniqueHosts]
+      .filter((h) => getState(h.id, hostStates) !== 'connecting')
+      .sort((a, b) => {
+        const score = (h: HostProfile) => {
+          if (inUseIds.has(h.id)) return 0
+          const st = getState(h.id, hostStates)
+          if (st === 'connected') return 1
+          if (h.kind === 'orca-env') return 2
+          if (h.kind === 'orca-ssh') return 3
+          return 4
+        }
+        return score(a) - score(b) || a.name.localeCompare(b.name)
+      })
+      .slice(0, 6)
+  }, [uniqueHosts, hostStates, leftEndpoint, rightEndpoint])
 
   return (
     <div ref={ref} class="hub-popover" role="dialog" aria-label="Central SFTP Bridge">
-      {/* Header matching Orca's native bottom popovers (e.g. Portas) */}
       <div class="hub-header">
         <div class="hub-header-left">
-          <span
-            class={`status-dot ${
-              connection.connected ? 'connected' : connection.connecting ? 'connecting' : ''
-            }`}
-          />
+          <span class={`status-dot ${dotClass(overallDot)}`} />
           <span class="hub-title">SFTP Bridge</span>
         </div>
         <div class="hub-header-right">
-          <span class="hub-subtitle">
-            {connection.connected
-              ? `${connection.hostName}`
-              : 'Desconectado'}
+          <span class="hub-subtitle" title={`${leftName} ⇄ ${rightName}`}>
+            {leftName} ⇄ {rightName}
           </span>
           <button class="icon-btn" onClick={props.onClose} title="Fechar (Esc)">
             <Icon name="close" size={13} />
@@ -75,7 +152,7 @@ export function QuickHubPopover(props: QuickHubPopoverProps) {
       </div>
 
       <div class="hub-body">
-        {/* Section 1: Transfers summary & live controls */}
+        {/* Section 1: Transfers */}
         <div class="hub-section">
           <div class="hub-section-head">
             <span>
@@ -132,9 +209,11 @@ export function QuickHubPopover(props: QuickHubPopoverProps) {
                     : tx.totalBytes > 0
                       ? Math.min(100, Math.round((tx.bytesTransferred / tx.totalBytes) * 100))
                       : 0
+                const dirSymbol =
+                  tx.direction === 'remote-to-remote' ? '⇄' : tx.direction === 'upload' ? '↑' : '↓'
                 return (
                   <div key={tx.id} class="hub-tx-row">
-                    <span class={`tx-dir ${tx.direction}`}>{tx.direction === 'upload' ? '↑' : '↓'}</span>
+                    <span class={`tx-dir ${tx.direction}`}>{dirSymbol}</span>
                     <div class="hub-tx-info">
                       <div class="hub-tx-name" title={tx.name}>
                         {tx.name}
@@ -146,29 +225,17 @@ export function QuickHubPopover(props: QuickHubPopoverProps) {
                     </div>
                     <div class="hub-tx-actions">
                       {(tx.status === 'running' || tx.status === 'queued') && (
-                        <button
-                          class="icon-btn"
-                          title="Pausar"
-                          onClick={() => props.onTransferAction('pause', tx.id)}
-                        >
+                        <button class="icon-btn" title="Pausar" onClick={() => props.onTransferAction('pause', tx.id)}>
                           <Icon name="pause" size={11} />
                         </button>
                       )}
                       {(tx.status === 'paused' || tx.status === 'error') && (
-                        <button
-                          class="icon-btn"
-                          title="Retomar"
-                          onClick={() => props.onTransferAction('resume', tx.id)}
-                        >
+                        <button class="icon-btn" title="Retomar" onClick={() => props.onTransferAction('resume', tx.id)}>
                           <Icon name="play" size={11} />
                         </button>
                       )}
                       {(tx.status === 'running' || tx.status === 'queued' || tx.status === 'paused') && (
-                        <button
-                          class="icon-btn"
-                          title="Parar"
-                          onClick={() => props.onTransferAction('cancel', tx.id)}
-                        >
+                        <button class="icon-btn" title="Parar" onClick={() => props.onTransferAction('cancel', tx.id)}>
                           <Icon name="stop" size={11} />
                         </button>
                       )}
@@ -224,62 +291,79 @@ export function QuickHubPopover(props: QuickHubPopoverProps) {
               <Icon name="plus" size={13} />
               <span>Nova conexão</span>
             </button>
-            <button
-              class="hub-action-item"
-              onClick={() => {
-                props.onRefreshHosts()
-              }}
-            >
-              <Icon name="refresh" size={13} />
-              <span>Atualizar hosts</span>
-            </button>
-            {connection.connected && (
-              <button
-                class="hub-action-item danger"
-                onClick={() => {
-                  props.onDisconnect()
-                  props.onClose()
-                }}
-              >
-                <Icon name="plug" size={13} />
-                <span>Desconectar</span>
-              </button>
-            )}
           </div>
         </div>
 
-        {/* Section 3: Quick Host Switcher */}
-        {quickHosts.length > 0 && (
-          <div class="hub-section">
-            <div class="hub-section-head">
-              <span>Servidores Orca</span>
-              <span>{quickHosts.length}</span>
-            </div>
-            <div class="hub-host-list">
-              {quickHosts.map((h) => {
-                const isCurrent = connection.connected && connection.hostId === h.id
-                return (
+        {/* Section 3: Hosts with REAL live SFTP status + in-use indicator */}
+        <div class="hub-section">
+          <div class="hub-section-head">
+            <span>Conexões SFTP ({connectedStates.length} online)</span>
+            <button
+              class="hub-link-btn"
+              onClick={() => {
+                props.onClose()
+                props.onOpenConnectionsManager()
+              }}
+            >
+              Gerenciar hosts...
+            </button>
+          </div>
+          <div class="hub-host-list">
+            {quickHosts.map((h) => {
+              const st = getState(h.id, hostStates)
+              const inLeft = leftEndpoint.kind === 'remote' && leftEndpoint.hostId === h.id
+              const inRight = rightEndpoint?.kind === 'remote' && rightEndpoint.hostId === h.id
+              const inUse = inLeft || inRight
+
+              return (
+                <div key={h.id} class={`hub-host-row ${inUse ? 'current' : ''}`}>
                   <button
-                    key={h.id}
-                    class={`hub-host-row ${isCurrent ? 'current' : ''}`}
+                    class="hub-host-select-area"
                     onClick={() => {
                       props.onClose()
-                      props.onConnectHost(h.id)
+                      props.onConnectHost(h.id, false)
                     }}
+                    title={hostStates[h.id]?.error || `${h.name} — ${stateText(st)}`}
                   >
-                    <span class="hub-host-left">
-                      <span class={`status-dot ${isCurrent || h.connected ? 'connected' : ''}`} />
-                      <span class="hub-host-name">{h.name}</span>
-                    </span>
-                    <span class="hub-host-meta">
-                      {isCurrent ? 'Conectado' : h.orcaVpnHost || h.hostname || h.sourceLabel}
-                    </span>
+                    <span class={`status-dot ${dotClass(st)}`} />
+                    <span class="hub-host-name">{h.name}</span>
+                    {inLeft && <span class="pill running">Esq</span>}
+                    {inRight && <span class="pill running">Dir</span>}
                   </button>
-                )
-              })}
-            </div>
+
+                  <div class="hub-host-right-actions">
+                    <span class="hub-host-meta">{stateText(st)}</span>
+                    {st === 'connected' ? (
+                      <>
+                        <button
+                          class="icon-btn"
+                          title="Reconectar"
+                          onClick={() => props.onConnectHost(h.id, true)}
+                        >
+                          <Icon name="refresh" size={11} />
+                        </button>
+                        <button
+                          class="icon-btn"
+                          title="Desconectar"
+                          onClick={() => props.onDisconnectHost(h.id)}
+                        >
+                          <Icon name="close" size={11} />
+                        </button>
+                      </>
+                    ) : st === 'connecting' ? null : (
+                      <button
+                        class="hub-link-btn"
+                        onClick={() => props.onConnectHost(h.id, false)}
+                      >
+                        Conectar
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
           </div>
-        )}
+        </div>
       </div>
     </div>
   )

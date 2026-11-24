@@ -90,8 +90,8 @@ export function TransferPanel({ snapshot, onAction, onSetPriority, onReorder }: 
           <Icon name="sync" size={24} />
           <h3>Nenhuma transferência na fila</h3>
           <p>
-            Clique com o botão direito em arquivos ou pastas (ou arraste entre Local e Remoto no modo
-            dividido) para iniciar envios e downloads.
+            Clique com o botão direito em arquivos ou pastas (ou arraste entre painéis Local ⇄ Remoto ou
+            Remoto ⇄ Remoto no modo dividido) para iniciar transferências.
           </p>
         </div>
       ) : (
@@ -114,9 +114,15 @@ export function TransferPanel({ snapshot, onAction, onSetPriority, onReorder }: 
                   <div class="tx-name-wrap">
                     <span
                       class={`tx-dir ${item.direction}`}
-                      title={item.direction === 'upload' ? 'Upload para servidor' : 'Download para local'}
+                      title={
+                        item.direction === 'remote-to-remote'
+                          ? 'Transferência direta Remoto ⇄ Remoto'
+                          : item.direction === 'upload'
+                            ? 'Upload para servidor'
+                            : 'Download para local'
+                      }
                     >
-                      {item.direction === 'upload' ? '↑' : '↓'}
+                      {item.direction === 'remote-to-remote' ? '⇄' : item.direction === 'upload' ? '↑' : '↓'}
                     </span>
                     <span class="tx-name" title={item.name}>
                       {item.name}
@@ -126,7 +132,9 @@ export function TransferPanel({ snapshot, onAction, onSetPriority, onReorder }: 
                 </div>
 
                 <div class="tx-paths" title={`${item.sourcePath} → ${item.targetPath}`}>
-                  {item.hostName} · {item.sourcePath} → {item.targetPath}
+                  {item.direction === 'remote-to-remote'
+                    ? `${item.sourceHostName || 'Remoto A'}:${item.sourcePath} → ${item.targetHostName || 'Remoto B'}:${item.targetPath}`
+                    : `${item.hostName} · ${item.sourcePath} → ${item.targetPath}`}
                 </div>
 
                 <div class="tx-progress-track">

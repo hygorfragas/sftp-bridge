@@ -71,7 +71,11 @@ test('worker handles local FS, quick editor, compress/extract, bookmarks and com
 
     // Command execution
     const statusText = await worker.command('sftp.status')
-    assert.ok(typeof statusText === 'string' && statusText.includes('Desconectado'))
+    assert.ok(
+      typeof statusText === 'string' &&
+        (statusText.includes('Desconectado') || statusText.includes('Conectado em')) &&
+        statusText.includes('0 ativa(s)')
+    )
 
     // Verify list includes our created archive & marks it as archive
     const list = await worker.request('fs.list', { side: 'local', path: dir })
@@ -112,13 +116,13 @@ test('worker handles local FS, quick editor, compress/extract, bookmarks and com
 
     // Session persistence across panel close/reopen
     await worker.request('session.save', {
-      lastHostId: 'orca-env:49f2de08-131d-4848-94ab-6d15fe45ad87',
+      lastHostId: 'orca-env:00000000-0000-4000-8000-000000000001',
       activeTab: 'remote',
       layout: 'split',
       splitRatio: 45
     })
     const boot2 = await worker.request('app.bootstrap')
-    assert.equal(boot2.session.lastHostId, 'orca-env:49f2de08-131d-4848-94ab-6d15fe45ad87')
+    assert.equal(boot2.session.lastHostId, 'orca-env:00000000-0000-4000-8000-000000000001')
     assert.equal(boot2.session.activeTab, 'remote')
     assert.equal(boot2.session.layout, 'split')
     assert.equal(boot2.session.splitRatio, 45)
