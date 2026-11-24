@@ -1,5 +1,9 @@
 # SFTP Bridge — Plugin para Orca IDE
 
+[Abrir na Orca (Catálogo da Comunidade)](https://orca.dev/plugins/hygorfragas.sftp-bridge?catalog=community) · [Repositório](https://github.com/hygorfragas/sftp-bridge) · Desenvolvido por **[Hygor Fragas](https://github.com/hygorfragas)**
+
+![SFTP Bridge Cover](./assets/cover.png)
+
 Ponte SFTP integrada à sidebar da **Orca IDE** com suporte unificado para:
 - **Hosts SSH** configurados na Orca (`orca host list`) e no `~/.ssh/config` (herdando `ProxyJump`, `IdentityFile`, `ssh-agent` e rotas de VPN)
 - **Servidores Orca Remotos** (`ssh-tunnel` vinculados automaticamente + servidores pareados via IP de VPN com detecção inteligente e vínculo em 1 clique)

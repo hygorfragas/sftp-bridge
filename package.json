@@ -1,6 +1,12 @@
 {
   "name": "sftp-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
+  "author": "Hygor Fragas <https://github.com/hygorfragas>",
+  "homepage": "https://github.com/hygorfragas/sftp-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hygorfragas/sftp-bridge.git"
+  },
   "private": true,
   "type": "module",
   "description": "SFTP Bridge plugin for Orca IDE",

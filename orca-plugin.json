@@ -2,10 +2,19 @@
   "manifestVersion": 2,
   "id": "sftp-bridge",
   "name": "SFTP Bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "icon": "assets/icon.png",
-  "description": "Dual-pane and tabbed SFTP browser for Orca SSH hosts and Remote Orca Servers with pause/resume priority transfer queue, server-side archive/extract, and quick file editor.",
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "SFTP Bridge dual-pane SFTP browser showing Local and Remote directories with live transfer queue"
+  },
+  "description": "Dual-pane and tabbed SFTP browser for Orca SSH hosts and Remote Orca Servers with Remote-to-Remote streaming, pause/resume priority transfer queue, diff/backup conflict guard, live log tail, and quick editor.",
+  "author": {
+    "name": "Hygor Fragas",
+    "url": "https://github.com/hygorfragas"
+  },
   "repository": "https://github.com/hygorfragas/sftp-bridge",
+  "homepage": "https://github.com/hygorfragas/sftp-bridge#readme",
   "license": "MIT",
   "engines": {
     "orca": ">=1.4.248"
