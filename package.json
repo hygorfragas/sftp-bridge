@@ -1,6 +1,6 @@
 {
   "name": "sftp-bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "Hygor Fragas <https://github.com/hygorfragas>",
   "homepage": "https://github.com/hygorfragas/sftp-bridge#readme",
   "repository": {

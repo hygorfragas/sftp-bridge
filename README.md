@@ -21,7 +21,9 @@ Ponte SFTP integrada à sidebar da **Orca IDE** com suporte unificado para:
   - **Modo Dividido (`>= 520px`, estilo Electerm):** painéis lado a lado com divisor redimensionável, **Navegação Sincronizada (`🔗 Sync`)**, drag-and-drop entre painéis, **arrastar direto do Finder do macOS** para upload e botão/gaveta de transferências em destaque.
   - **Modo Abas (`< 520px` ou manual):** `Local` | `Remoto` | `Transferências` com badge/ponto vermelho dinâmico; abaixo de `310px` as abas viram um menu dropdown compacto.
 - **Persistência completa de sessão:** lembra os endpoints dos dois painéis, pastas Local e Remota por host, layout, divisor e estado do `Sync` ao sair e voltar ao painel.
-- **Segurança máxima contra sobrescrita:** detecção automática de conflitos em uploads, downloads e transferências remoto-a-remoto com **Diff visual linha a linha**, opção **Criar backup `.bak` antes de substituir**, **Renomear e manter ambos** ou **Pular conflitantes**.
+- **Segurança máxima contra sobrescrita:** detecção automática de conflitos em uploads, downloads e transferências remoto-a-remoto com **destaque explícito do servidor de destino** (mesmo quando os caminhos são idênticos), **Diff visual linha a linha**, opção **Criar backup `.bak` antes de substituir**, **Renomear e manter ambos** ou **Pular conflitantes**.
+
+![Remote-to-Remote Conflict & Diff Preview](./assets/screenshot-remote-diff.png)
 - **Fila de Transferências completa:** pausar, iniciar/retomar do byte exato (`.orca-sftp.part`), parar/cancelar, prioridade (`Alta`, `Normal`, `Baixa`), reordenação (`Topo`, `Subir`, `Descer`), velocidade, ETA e item na Status Bar da Orca.
 - **Busca recursiva em subpastas (`Subpastas`):** localiza arquivos em diretórios profundos tanto no Local quanto no Remoto (`find`) e abre direto no editor ou preview.
 - **Visualizador de Logs ao Vivo (`tail -f`):** acompanhe logs remotos ou locais em streaming com filtro em tempo real, pausa de scroll e quebra de linha.

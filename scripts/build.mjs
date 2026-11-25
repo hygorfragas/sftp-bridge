@@ -81,6 +81,7 @@ async function stageCleanPluginDir() {
     copyFile(resolve(root, 'README.md'), resolve(stage, 'README.md')),
     copyFile(resolve(root, 'assets/icon.png'), resolve(stage, 'assets/icon.png')),
     copyFile(resolve(root, 'assets/cover.png'), resolve(stage, 'assets/cover.png')),
+    copyFile(resolve(root, 'assets/screenshot-remote-diff.png'), resolve(stage, 'assets/screenshot-remote-diff.png')),
     copyFile(resolve(root, 'dist/worker.mjs'), resolve(stage, 'dist/worker.mjs')),
     copyFile(resolve(root, 'panel/index.html'), resolve(stage, 'panel/index.html')),
     copyFile(resolve(root, 'panel/app.js'), resolve(stage, 'panel/app.js')),

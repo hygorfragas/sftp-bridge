@@ -452,14 +452,12 @@ export function ConflictModal({
   const [openDiffPath, setOpenDiffPath] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const destLabel =
+  const destTitle =
     direction === 'upload'
-      ? 'no servidor remoto'
+      ? targetLabel || 'servidor remoto'
       : direction === 'download'
-        ? 'no diretório local'
-        : targetLabel
-          ? `em ${targetLabel}`
-          : 'no servidor de destino'
+        ? 'diretório local'
+        : targetLabel || 'servidor de destino'
   const srcTag = sourceLabel || (direction === 'upload' ? 'Local' : 'Remoto')
   const dstTag = targetLabel || (direction === 'upload' ? 'Remoto' : direction === 'download' ? 'Local' : 'Destino')
   const nonConflictingCount = Math.max(0, totalCount - conflicts.length)
@@ -504,22 +502,26 @@ export function ConflictModal({
   return (
     <div class="modal-backdrop" onClick={onClose}>
       <div
-        class="modal-card"
-        style={{ maxWidth: activeDiff ? '560px' : '420px' }}
+        class="modal-card conflict-modal-card"
+        style={{ maxWidth: activeDiff ? '580px' : '440px' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3>Arquivo já existe {destLabel}</h3>
-        <p class="modal-desc">
-          {single
-            ? `"${single.name}" já existe no destino. Compare as diferenças, renomeie para manter ambos ou substitua com backup .bak.`
-            : `${conflicts.length} item(ns) já existem no destino. Escolha como prosseguir para evitar sobrescrita acidental.`}
-        </p>
+        <div class="conflict-modal-head">
+          <h3>
+            Conflito em <span class="conflict-dest-name">{destTitle}</span>
+          </h3>
+          <p class="modal-desc">
+            {single
+              ? `"${single.name}" já existe no destino. Compare as versões ou escolha uma ação abaixo.`
+              : `${conflicts.length} itens já existem no destino (${dstTag}). Escolha como prosseguir.`}
+          </p>
+        </div>
 
         <div class="conflict-box">
           {conflicts.map((c) => (
             <div key={c.sourcePath} class="conflict-item">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
-                <strong>{c.name}</strong>
+              <div class="conflict-item-top">
+                <strong class="conflict-item-name" title={c.name}>{c.name}</strong>
                 {!c.isDirectory && !c.targetIsDirectory && (
                   <button
                     type="button"
@@ -535,19 +537,35 @@ export function ConflictModal({
                   </button>
                 )}
               </div>
-              <div class="conflict-meta">
-                <div>
-                  <div>Origem ({srcTag})</div>
-                  <div>
-                    {c.isDirectory ? 'Pasta' : formatBytes(c.sourceSize)}
-                    {c.sourceMtimeMs ? ` · ${formatTimestamp(c.sourceMtimeMs)}` : ''}
+
+              <div class="conflict-rows">
+                <div class="conflict-side-row">
+                  <span class="conflict-role">Origem</span>
+                  <div class="conflict-side-detail">
+                    <div class="conflict-side-line">
+                      <span class="conflict-host-name">{srcTag}</span>
+                      <span class="conflict-sep">·</span>
+                      <span class="conflict-side-path" title={c.sourcePath}>{c.sourcePath}</span>
+                    </div>
+                    <div class="conflict-side-stats">
+                      {c.isDirectory ? 'Pasta' : formatBytes(c.sourceSize)}
+                      {c.sourceMtimeMs ? ` · ${formatTimestamp(c.sourceMtimeMs)}` : ''}
+                    </div>
                   </div>
                 </div>
-                <div>
-                  <div>Existente ({dstTag})</div>
-                  <div>
-                    {c.targetIsDirectory ? 'Pasta' : formatBytes(c.targetSize)}
-                    {c.targetMtimeMs ? ` · ${formatTimestamp(c.targetMtimeMs)}` : ''}
+
+                <div class="conflict-side-row target">
+                  <span class="conflict-role target">Destino</span>
+                  <div class="conflict-side-detail">
+                    <div class="conflict-side-line">
+                      <span class="conflict-host-name target">{dstTag}</span>
+                      <span class="conflict-sep">·</span>
+                      <span class="conflict-side-path" title={c.targetPath}>{c.targetPath}</span>
+                    </div>
+                    <div class="conflict-side-stats">
+                      {c.targetIsDirectory ? 'Pasta' : formatBytes(c.targetSize)}
+                      {c.targetMtimeMs ? ` · ${formatTimestamp(c.targetMtimeMs)}` : ''}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -557,46 +575,52 @@ export function ConflictModal({
 
         {activeDiff && (
           <div class="diff-box">
+            <div class="diff-header">
+              <span class="diff-hosts-legend">
+                <span class="diff-host-label target">− {dstTag} (atual)</span>
+                <span class="conflict-sep">→</span>
+                <span class="diff-host-label source">+ {srcTag} (novo)</span>
+              </span>
+              {!activeDiff.binary && !activeDiff.tooLarge && activeDiff.lines.length > 0 && (
+                <span>
+                  <span class="diff-stat-add">+{activeDiff.added}</span>{' '}
+                  <span class="diff-stat-rem">-{activeDiff.removed}</span>
+                  {activeDiff.truncated ? ' (truncado)' : ''}
+                </span>
+              )}
+            </div>
             {activeDiff.binary ? (
               <div class="diff-empty">
-                Arquivo binário — Origem: {formatBytes(activeDiff.sourceSize)} · Existente:{' '}
+                Arquivo binário — {srcTag}: {formatBytes(activeDiff.sourceSize)} · {dstTag}:{' '}
                 {formatBytes(activeDiff.targetSize)}
               </div>
             ) : activeDiff.tooLarge ? (
               <div class="diff-empty">
-                Arquivo maior que 256 KB para diff rápido — Origem: {formatBytes(activeDiff.sourceSize)} ·
-                Existente: {formatBytes(activeDiff.targetSize)}
+                Arquivo maior que 256 KB para diff rápido — {srcTag}: {formatBytes(activeDiff.sourceSize)} ·{' '}
+                {dstTag}: {formatBytes(activeDiff.targetSize)}
               </div>
             ) : activeDiff.lines.length === 0 ? (
-              <div class="diff-empty">Os arquivos têm conteúdo idêntico!</div>
+              <div class="diff-empty">
+                Os arquivos em {srcTag} e {dstTag} têm conteúdo idêntico.
+              </div>
             ) : (
-              <>
-                <div class="diff-header">
-                  <span>Existente → Novo</span>
-                  <span>
-                    <span class="diff-stat-add">+{activeDiff.added}</span>{' '}
-                    <span class="diff-stat-rem">-{activeDiff.removed}</span>
-                    {activeDiff.truncated ? ' (truncado)' : ''}
-                  </span>
-                </div>
-                <div class="diff-lines">
-                  {activeDiff.lines.map((line, i) => (
-                    <div key={i} class={`diff-line ${line.kind}`}>
-                      <span class="diff-sign">
-                        {line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '}
-                      </span>
-                      <span class="diff-text">{line.text || ' '}</span>
-                    </div>
-                  ))}
-                </div>
-              </>
+              <div class="diff-lines">
+                {activeDiff.lines.map((line, i) => (
+                  <div key={i} class={`diff-line ${line.kind}`}>
+                    <span class="diff-sign">
+                      {line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '}
+                    </span>
+                    <span class="diff-text">{line.text || ' '}</span>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         )}
 
         {single && (
           <div class="field">
-            <label>Novo nome para salvar sem substituir</label>
+            <label>Salvar com outro nome (mantém ambos)</label>
             <input
               value={customName}
               onInput={(e) => setCustomName((e.target as HTMLInputElement).value)}
@@ -610,26 +634,27 @@ export function ConflictModal({
             checked={backupBak}
             onChange={(e) => setBackupBak((e.target as HTMLInputElement).checked)}
           />
-          <span>Criar backup `.bak` do arquivo existente antes de substituir</span>
+          <span>Criar backup (.bak) em {dstTag} antes de substituir</span>
         </label>
 
         {error && <div style={{ color: 'var(--danger)', fontSize: '11.5px' }}>{error}</div>}
 
-        <div class="modal-actions" style={{ flexWrap: 'wrap' }}>
-          <button class="btn ghost" disabled={busy} onClick={onClose}>
+        <div class="modal-actions">
+          <button class="btn ghost" style={{ marginRight: 'auto' }} disabled={busy} onClick={onClose}>
             Cancelar
           </button>
           {nonConflictingCount > 0 && (
             <button class="btn" disabled={busy} onClick={() => void runAction(onSkip)}>
-              Pular ({nonConflictingCount} novo{nonConflictingCount > 1 ? 's' : ''})
+              Pular ({nonConflictingCount})
             </button>
           )}
           <button
             class="btn danger"
             disabled={busy}
+            title={`Substituir arquivo existente em ${dstTag}`}
             onClick={() => void runAction(() => onOverwrite(backupBak))}
           >
-            {backupBak ? 'Backup .bak e Substituir' : 'Substituir'}
+            {backupBak ? 'Substituir (.bak)' : 'Substituir'}
           </button>
           <button
             class="btn primary"
@@ -646,7 +671,7 @@ export function ConflictModal({
               })
             }
           >
-            {single ? 'Renomear e manter ambos' : 'Renomear conflitantes'}
+            {single ? 'Renomear' : 'Renomear todos'}
           </button>
         </div>
       </div>
